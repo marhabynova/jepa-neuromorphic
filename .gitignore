@@ -2,6 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
+.brian2_cache/
 
 # Private - contains real name/institutional email, never push
 RESEARCH_NOTES.md
