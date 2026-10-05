@@ -3,6 +3,9 @@
 __pycache__/
 *.pyc
 
+# Private - contains real name/institutional email, never push
+RESEARCH_NOTES.md
+
 # Large datasets, not meant for git
 data_real/
 
