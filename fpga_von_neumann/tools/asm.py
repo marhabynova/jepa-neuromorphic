@@ -146,6 +146,19 @@ p.label('takeC')
 # addi x13, x0, 555  -> branch target
 p.emit(lambda a, L: i_type(555, 0, 0b000, 13, OP_ITYPE))
 
+# --- MMIO smoke test: SW to addr 0xFF000000 must hit cpu.v's mmio_out
+# port, not dmem (see RESEARCH_NOTES.md §46 next-step: debug/MMIO port) ---
+# addi x14, x0, 255   -> 0x000000FF
+p.emit(lambda a, L: i_type(255, 0, 0b000, 14, OP_ITYPE))
+# addi x15, x0, 24    -> shift amount
+p.emit(lambda a, L: i_type(24, 0, 0b000, 15, OP_ITYPE))
+# sll  x16, x14, x15  -> x16 = 0xFF000000 (MMIO base address)
+p.emit(lambda a, L: r_type(0, 15, 14, 0b001, 16, OP_RTYPE))
+# addi x17, x0, 777   -> value to send out the debug port
+p.emit(lambda a, L: i_type(777, 0, 0b000, 17, OP_ITYPE))
+# sw   x17, 0(x16)    -> mmio_out <= 777, mmio_valid pulses (dmem untouched)
+p.emit(lambda a, L: s_type(0, 17, 16, 0b010, OP_STORE))
+
 p.label('halt')
 # jal x0, halt  -> infinite self-loop
 p.emit(lambda a, L: j_type(L['halt'] - a, 0, OP_JAL))

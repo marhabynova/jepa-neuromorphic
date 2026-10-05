@@ -1,6 +1,16 @@
 module cpu (
-    input clk,
-    input rst
+    input  clk,
+    input  rst,
+    // Memory-mapped I/O: any SW whose target address has top byte 0xFF
+    // (i.e. addr[31:24] == 8'hFF) is diverted here instead of dmem - the
+    // real-hardware analogue of writing to an LED/UART register instead of
+    // RAM. mmio_out holds the last word written; mmio_valid pulses high for
+    // exactly the cycle of a qualifying store, so an off-chip consumer can
+    // edge-detect it. Added so cpu has externally observable outputs (see
+    // RESEARCH_NOTES.md §46 - without this, yosys `synth` sweeps the whole
+    // design away as unobserved dead logic).
+    output reg [31:0] mmio_out,
+    output             mmio_valid
 );
     reg [31:0] pc;
     wire [31:0] instr;
@@ -51,10 +61,20 @@ module cpu (
     wire [31:0] alu_result;
     alu alu_u (.a(rd_data1), .b(alu_b), .op(alu_op), .result(alu_result));
 
+    wire mmio_sel = mem_write && (alu_result[31:24] == 8'hFF);
+    assign mmio_valid = mmio_sel;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst)
+            mmio_out <= 32'd0;
+        else if (mmio_sel)
+            mmio_out <= rd_data2;
+    end
+
     wire [31:0] dmem_rd;
     dmem dmem_u (
         .clk(clk), .addr(alu_result), .wr_data(rd_data2),
-        .we(mem_write), .rd_data(dmem_rd)
+        .we(mem_write && !mmio_sel), .rd_data(dmem_rd)
     );
 
     wire [31:0] pc_plus4 = pc + 32'd4;
