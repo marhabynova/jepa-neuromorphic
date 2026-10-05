@@ -31,7 +31,7 @@ from real_data_shd import load_shd, make_loader, FLAT_DIM
 from dense_jepa import DenseJEPA
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SEED = 0
+SEEDS = [0, 1, 2]  # §70d called 1-seed "preliminary" - matches §34/§35's 3-seed bar
 HIDDEN_DIM = 128
 REPR_DIM = 64
 BATCH_SIZE = 64
@@ -80,7 +80,6 @@ class GateNet(nn.Module):
 
 
 def train_dense_jepa(train_loader):
-    torch.manual_seed(SEED)
     model = DenseJEPA(FLAT_DIM, HIDDEN_DIM, REPR_DIM).to(DEVICE)
     opt = torch.optim.Adam(
         list(model.context_encoder.parameters()) + list(model.predictor.parameters()), lr=JEPA_LR
@@ -204,48 +203,63 @@ def evaluate(gate, test_contexts, test_errors):
     }
 
 
-if __name__ == "__main__":
-    print("=== Loading SHD ===")
+def run_seed(seed):
+    torch.manual_seed(seed)
     train_set = load_shd(train=True)
     eval_set = load_shd(train=False)
     train_loader = make_loader(train_set, BATCH_SIZE, shuffle=True)
     eval_loader = make_loader(eval_set, BATCH_SIZE, shuffle=False)
     gate_train_loader = make_loader(train_set, BATCH_SIZE, shuffle=True)
 
-    print("\n=== Step 1: train DenseJEPA (the oracle the gate will distill) ===")
     dense_model = train_dense_jepa(train_loader)
     n_dense_params = count_params(dense_model.context_encoder)
 
-    print("\n=== Step 2: collect surprise-labeling dataset from the frozen DenseJEPA ===")
     train_contexts, train_errors = collect_surprise_dataset(dense_model, gate_train_loader, n_batches=64)
     test_contexts, test_errors = collect_surprise_dataset(dense_model, eval_loader, n_batches=16)
-    print(f"  train: {train_contexts.shape[0]} samples, test: {test_contexts.shape[0]} samples")
-    print(f"  train prediction-error: mean={train_errors.mean():.4f} std={train_errors.std():.4f}")
 
-    print("\n=== Step 3: train the gate (distillation) ===")
-    torch.manual_seed(SEED)
     gate = GateNet(FLAT_DIM).to(DEVICE)
     n_gate_params = count_params(gate)
     train_gate(gate, train_contexts, train_errors)
 
-    print("\n=== Step 4: evaluate against baselines ===")
     result = evaluate(gate, test_contexts, test_errors)
+    result["n_dense_params"] = n_dense_params
+    result["n_gate_params"] = n_gate_params
+    result["lift_pp"] = (result["gate_recall"] - result["random_expected_recall"]) * 100
+    return result
+
+
+if __name__ == "__main__":
+    import statistics
+
+    all_results = []
+    for seed in SEEDS:
+        print(f"\n{'='*20} seed={seed} {'='*20}")
+        r = run_seed(seed)
+        all_results.append(r)
+        print(f"  correlation={r['correlation']:.4f} (trivial L2norm={r['trivial_l2norm_correlation']:.4f}) "
+              f"duty_cycle={r['duty_cycle']*100:.1f}% recall={r['gate_recall']*100:.1f}% "
+              f"(random={r['random_expected_recall']*100:.1f}%) lift={r['lift_pp']:+.1f}pp")
+
+    def summarize(key, scale=1.0):
+        vals = [r[key] * scale for r in all_results]
+        mean = statistics.mean(vals)
+        spread = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        return mean, spread, vals
+
+    corr_mean, corr_spread, corr_vals = summarize("correlation")
+    trivial_mean, trivial_spread, _ = summarize("trivial_l2norm_correlation")
+    recall_mean, recall_spread, recall_vals = summarize("gate_recall", 100)
+    lift_mean, lift_spread, lift_vals = summarize("lift_pp")
 
     print(f"\n{'='*60}")
-    print(f"DenseJEPA context_encoder params: {n_dense_params:,}")
-    print(f"Gate params:                      {n_gate_params:,}  ({n_dense_params / n_gate_params:.1f}x smaller)")
+    print(f"SUMMARY across {len(SEEDS)} seeds (mean +/- stdev)")
     print(f"{'='*60}")
-    print(f"Test set size: {result['n_test']}")
-    print(f"Gate score <-> true prediction-error correlation: {result['correlation']:.4f}")
-    print(f"  trivial baseline (raw input total spike count) correlation: {result['trivial_spike_count_correlation']:.4f}")
-    print(f"  trivial baseline (raw input L2 norm) correlation:           {result['trivial_l2norm_correlation']:.4f}")
-    print(f"Surprise definition: top {100 - SURPRISE_PERCENTILE}% prediction-error "
-          f"({result['n_surprising']} of {result['n_test']} samples)")
-    print(f"Gate duty cycle (fraction of time dense encoder is woken): {result['duty_cycle']*100:.1f}%")
-    print(f"  -> dense encoder can SLEEP {(1-result['duty_cycle'])*100:.1f}% of the time")
-    print(f"Gate recall of truly-surprising samples:   {result['gate_recall']*100:.1f}%")
-    print(f"Random-gate expected recall (same duty cycle, 0 info): {result['random_expected_recall']*100:.1f}%")
-    print(f"Always-on baseline: duty_cycle=100%, recall=100% (reference point, not a competitor)")
-    lift = result['gate_recall'] - result['random_expected_recall']
-    print(f"\nGate lift over random at matched duty cycle: {lift*100:+.1f}pp")
-    print("NOTE: single seed, first pass - preliminary, needs multi-seed re-run before citing as robust.")
+    print(f"DenseJEPA context_encoder params: {all_results[0]['n_dense_params']:,}")
+    print(f"Gate params:                      {all_results[0]['n_gate_params']:,} "
+          f"({all_results[0]['n_dense_params'] / all_results[0]['n_gate_params']:.1f}x smaller)")
+    print(f"Gate<->true-error correlation: {corr_mean:.4f} +/- {corr_spread:.4f} (per-seed: {[f'{v:.4f}' for v in corr_vals]})")
+    print(f"Trivial L2-norm baseline correlation: {trivial_mean:.4f} +/- {trivial_spread:.4f}")
+    print(f"Gate recall @ matched duty cycle: {recall_mean:.1f}% +/- {recall_spread:.1f}% (per-seed: {[f'{v:.1f}' for v in recall_vals]})")
+    print(f"Lift over random: {lift_mean:+.1f}pp +/- {lift_spread:.1f}pp (per-seed: {[f'{v:+.1f}' for v in lift_vals]})")
+    worst_lift = min(lift_vals)
+    print(f"Worst-seed lift: {worst_lift:+.1f}pp (if this is still clearly >0, the effect is robust, not a lucky seed)")
