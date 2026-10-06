@@ -39,6 +39,17 @@ touch).
 First pass - single seed, one untuned (eta, decay) setting. Preliminary by
 the same standard as Awake Gate's first run (§70d) - needs the same
 multi-seed + sensitivity treatment before being cited as robust.
+
+CORRECTED (RESEARCH_NOTES.md §73, Opus audit): evaluate_condition() used to
+re-iterate a shuffle=True probe-training loader fresh on every call, so
+each condition (STATIC/ONLINE_NAIVE/SLEEP) got a DIFFERENT random draw of
+probe-training samples - injecting measurement noise (sd ~1.4-3.2pp per
+call, 98% of it from this resampling) directly into the quantity being
+compared. This made every §71b/§71c Sleep-vs-Static delta uninterpretable
+(the reported effects were smaller than this noise floor). Fixed: the
+probe-training set is now drawn ONCE per seed (see `draw_fixed_batches`)
+and reused, unchanged, across all three conditions within that seed -
+only the model differs, not the probe data.
 """
 import copy
 import statistics
@@ -132,6 +143,34 @@ def extract_embeddings(model, loader, n_batches):
     return torch.cat(embs, dim=0), torch.cat(labels, dim=0)
 
 
+def draw_fixed_batches(loader, n_batches):
+    """Materialize n_batches of (x,y) ONCE so every condition that reuses
+    this list sees IDENTICAL probe-training data - the fix for the
+    probe-resampling noise found in the §73 audit."""
+    batches = []
+    it = iter(loader)
+    for _ in range(n_batches):
+        try:
+            x, y = next(it)
+        except StopIteration:
+            it = iter(loader)
+            x, y = next(it)
+        batches.append((x, y))
+    return batches
+
+
+@torch.no_grad()
+def extract_embeddings_from_batches(model, batches):
+    embs, labels = [], []
+    for x, y in batches:
+        x = x.to(DEVICE)
+        context, _ = split_context_target(x)
+        repr_out = model.context_encoder(context)
+        embs.append(repr_out.cpu())
+        labels.append(y)
+    return torch.cat(embs, dim=0), torch.cat(labels, dim=0)
+
+
 def train_probe_and_get_module(train_emb, train_lab, device, steps=PROBE_STEPS, lr=1e-2):
     """Local variant of downstream_probe.train_linear_probe that also
     returns the trained nn.Linear module, so we can evaluate it separately
@@ -151,8 +190,8 @@ def train_probe_and_get_module(train_emb, train_lab, device, steps=PROBE_STEPS, 
     return probe
 
 
-def evaluate_condition(name, model, probe_train_loader, known_eval_loader, new_eval_loader):
-    train_emb, train_lab = extract_embeddings(model, probe_train_loader, PROBE_TRAIN_BATCHES)
+def evaluate_condition(name, model, probe_train_batches, known_eval_loader, new_eval_loader):
+    train_emb, train_lab = extract_embeddings_from_batches(model, probe_train_batches)
     known_emb, known_lab = extract_embeddings(model, known_eval_loader, 16)
     new_emb, new_lab = extract_embeddings(model, new_eval_loader, 16)
 
@@ -194,6 +233,9 @@ if __name__ == "__main__":
     new_eval_loader = make_loader(new_eval, BATCH_SIZE, shuffle=False)
     mixed_probe_loader = make_loader(torch.utils.data.ConcatDataset([known_train, new_train]),
                                       BATCH_SIZE, shuffle=True)
+    # Fixed ONCE (§73 fix) - every condition below evaluates against this
+    # exact same probe-training data, not a fresh shuffle per condition.
+    probe_train_batches = draw_fixed_batches(mixed_probe_loader, PROBE_TRAIN_BATCHES)
 
     print("\n=== Step 1: train base DenseJEPA on KNOWN classes only ===")
     base_model = DenseJEPA(FLAT_DIM, HIDDEN_DIM, REPR_DIM).to(DEVICE)
@@ -209,9 +251,15 @@ if __name__ == "__main__":
     # Side-check: does the gate, trained only on KNOWN classes, treat NEW
     # (unfamiliar) classes as more surprising on average? A real novelty
     # signal should score new-class samples higher.
+    # CORRECTED (§73 audit): the KNOWN side used to redraw from
+    # known_train_loader, the SAME pool the gate was fit on (64 of its
+    # batches) - a fresh 7-batch draw overlapped it ~34% in expectation,
+    # biasing the KNOWN baseline upward. Now uses known_eval (true holdout,
+    # never seen by gate or base_model). NEW side already used new_train,
+    # which is fine - the gate never saw ANY new-class data during training.
     with torch.no_grad():
         new_probe_contexts, _ = collect_surprise_dataset(base_model, new_train_loader, n_batches=7)
-        known_sample_contexts, _ = collect_surprise_dataset(base_model, known_train_loader, n_batches=7)
+        known_sample_contexts, _ = collect_surprise_dataset(base_model, known_eval_loader, n_batches=7)
         new_scores = gate(new_probe_contexts.to(DEVICE)).cpu()
         known_scores = gate(known_sample_contexts.to(DEVICE)).cpu()
     print(f"  gate score on held-out KNOWN-class samples: mean={known_scores.mean():.4f}")
@@ -271,7 +319,7 @@ if __name__ == "__main__":
     print("\n=== Step 4: evaluate all 3 conditions (same probe protocol, known/new split) ===")
     results = []
     for name, model in [("STATIC", static_model), ("ONLINE_NAIVE", online_model), ("SLEEP", sleep_model)]:
-        r = evaluate_condition(name, model, mixed_probe_loader, known_eval_loader, new_eval_loader)
+        r = evaluate_condition(name, model, probe_train_batches, known_eval_loader, new_eval_loader)
         results.append(r)
 
     print(f"\n{'='*70}")

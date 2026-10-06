@@ -1,3 +1,12 @@
+# SUPERSEDED (RESEARCH_NOTES.md §73, Opus audit): evaluate_condition() here
+# measured against a probe-training set that was re-shuffled on every call,
+# injecting more noise (sd ~1.4-3.2pp) than the effects being compared -
+# this script's numbers are NOT reliable (see §73 for the full finding).
+# Also now broken as-is: evaluate_condition's signature changed to take a
+# fixed batch list, not a loader. Use sleep_consolidation_corrected.py,
+# which fixes the noise bug AND adds the missing control conditions
+# (DECAY_ONLY, NODECAY, RANDOMWAKE) this script never had.
+
 """
 Multi-seed confirmation of sleep_consolidation_oja.py's single-seed
 directional result: error-modulated Oja's rule at eta=1e-4 (highest overall,

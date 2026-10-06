@@ -169,9 +169,16 @@ def evaluate(gate, test_contexts, test_errors):
 
     # Mandatory trivial baselines (project convention - a learned mechanism
     # must beat a naive statistic of the raw input, not just random chance).
+    # CORRECTED (RESEARCH_NOTES.md §73, Opus audit): trivial_spike_count on
+    # sigma-delta-encoded input (make_loader's default) sums SIGNED deltas,
+    # not spike counts - that's why it read negative. Using .abs().sum() is
+    # the actual sparse-activity analogue; kept both for continuity but the
+    # abs version is the real baseline.
     trivial_spike_count = test_contexts.sum(dim=(1, 2))
+    trivial_abs_spike_count = test_contexts.abs().sum(dim=(1, 2))
     trivial_l2norm = test_contexts.pow(2).sum(dim=(1, 2)).sqrt()
     corr_trivial_count = pearson_corr(trivial_spike_count, test_errors).item()
+    corr_trivial_abs_count = pearson_corr(trivial_abs_spike_count, test_errors).item()
     corr_trivial_norm = pearson_corr(trivial_l2norm, test_errors).item()
 
     true_thresh = np.percentile(test_errors.numpy(), SURPRISE_PERCENTILE)
@@ -191,15 +198,30 @@ def evaluate(gate, test_contexts, test_errors):
     # expected recall of a random selector = duty_cycle (no information).
     random_expected_recall = duty_cycle
 
+    # CORRECTED (§73 audit): the project's own convention requires a
+    # TRIVIAL-statistic baseline, not just random, for every headline
+    # number - this was applied to `correlation` above but NEVER to
+    # recall/duty-cycle, which is what the "+29.9pp lift" claim in §70f
+    # was actually built on. Added here: threshold the trivial L2-norm
+    # statistic at the SAME percentile and compute its recall exactly like
+    # the gate's.
+    trivial_thresh = np.percentile(trivial_l2norm.numpy(), SURPRISE_PERCENTILE)
+    trivial_wakes = trivial_l2norm >= trivial_thresh
+    trivial_recall = (trivial_wakes & is_surprising).sum().item() / max(n_surprising, 1)
+
     return {
         "n_test": test_contexts.shape[0],
         "correlation": corr,
         "trivial_spike_count_correlation": corr_trivial_count,
+        "trivial_abs_spike_count_correlation": corr_trivial_abs_count,
         "trivial_l2norm_correlation": corr_trivial_norm,
         "n_surprising": n_surprising,
         "duty_cycle": duty_cycle,
         "gate_recall": recall,
         "random_expected_recall": random_expected_recall,
+        "trivial_recall": trivial_recall,
+        "lift_over_random_pp": (recall - random_expected_recall) * 100,
+        "lift_over_trivial_pp": (recall - trivial_recall) * 100,
     }
 
 
@@ -224,7 +246,6 @@ def run_seed(seed):
     result = evaluate(gate, test_contexts, test_errors)
     result["n_dense_params"] = n_dense_params
     result["n_gate_params"] = n_gate_params
-    result["lift_pp"] = (result["gate_recall"] - result["random_expected_recall"]) * 100
     return result
 
 
@@ -238,7 +259,8 @@ if __name__ == "__main__":
         all_results.append(r)
         print(f"  correlation={r['correlation']:.4f} (trivial L2norm={r['trivial_l2norm_correlation']:.4f}) "
               f"duty_cycle={r['duty_cycle']*100:.1f}% recall={r['gate_recall']*100:.1f}% "
-              f"(random={r['random_expected_recall']*100:.1f}%) lift={r['lift_pp']:+.1f}pp")
+              f"(random={r['random_expected_recall']*100:.1f}%, trivial={r['trivial_recall']*100:.1f}%) "
+              f"lift_vs_random={r['lift_over_random_pp']:+.1f}pp lift_vs_trivial={r['lift_over_trivial_pp']:+.1f}pp")
 
     def summarize(key, scale=1.0):
         vals = [r[key] * scale for r in all_results]
@@ -249,7 +271,9 @@ if __name__ == "__main__":
     corr_mean, corr_spread, corr_vals = summarize("correlation")
     trivial_mean, trivial_spread, _ = summarize("trivial_l2norm_correlation")
     recall_mean, recall_spread, recall_vals = summarize("gate_recall", 100)
-    lift_mean, lift_spread, lift_vals = summarize("lift_pp")
+    trivial_recall_mean, trivial_recall_spread, _ = summarize("trivial_recall", 100)
+    lift_random_mean, lift_random_spread, lift_random_vals = summarize("lift_over_random_pp")
+    lift_trivial_mean, lift_trivial_spread, lift_trivial_vals = summarize("lift_over_trivial_pp")
 
     print(f"\n{'='*60}")
     print(f"SUMMARY across {len(SEEDS)} seeds (mean +/- stdev)")
@@ -260,6 +284,9 @@ if __name__ == "__main__":
     print(f"Gate<->true-error correlation: {corr_mean:.4f} +/- {corr_spread:.4f} (per-seed: {[f'{v:.4f}' for v in corr_vals]})")
     print(f"Trivial L2-norm baseline correlation: {trivial_mean:.4f} +/- {trivial_spread:.4f}")
     print(f"Gate recall @ matched duty cycle: {recall_mean:.1f}% +/- {recall_spread:.1f}% (per-seed: {[f'{v:.1f}' for v in recall_vals]})")
-    print(f"Lift over random: {lift_mean:+.1f}pp +/- {lift_spread:.1f}pp (per-seed: {[f'{v:+.1f}' for v in lift_vals]})")
-    worst_lift = min(lift_vals)
-    print(f"Worst-seed lift: {worst_lift:+.1f}pp (if this is still clearly >0, the effect is robust, not a lucky seed)")
+    print(f"Trivial-baseline recall @ matched duty cycle: {trivial_recall_mean:.1f}% +/- {trivial_recall_spread:.1f}%")
+    print(f"Lift over RANDOM: {lift_random_mean:+.1f}pp +/- {lift_random_spread:.1f}pp (per-seed: {[f'{v:+.1f}' for v in lift_random_vals]})")
+    print(f"Lift over TRIVIAL (the honest comparison, §73 audit): {lift_trivial_mean:+.1f}pp +/- {lift_trivial_spread:.1f}pp "
+          f"(per-seed: {[f'{v:+.1f}' for v in lift_trivial_vals]})")
+    worst_lift = min(lift_trivial_vals)
+    print(f"Worst-seed lift over trivial: {worst_lift:+.1f}pp (this, not lift-over-random, is the number to cite)")
