@@ -190,7 +190,7 @@ def eval_hybrid(world_model, V, gate, threshold, pairs):
     return d_rate, d_n, d_calls, nd_rate, nd_n, nd_calls
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and "--retrained-v" not in __import__("sys").argv:
     SEEDS = [0, 1, 2]
     results = {"detour": [], "no_detour": [], "real_calls": []}
     for seed in SEEDS:
@@ -221,3 +221,67 @@ if __name__ == "__main__":
     print(f"\nFor comparison (§82, same held-out protocol):")
     print(f"  Stage B (always imagine):  detour=67.7%+/-17.3 (worst 49.0%)  no-detour=75.6%+/-14.1 (worst 62.3%)")
     print(f"  avg real-env calls/episode spent by hybrid: {statistics.mean(results['real_calls']):.1f}")
+
+
+# ---------- §89: redo with the §86-corrected step budget, not a stability fix ----------
+# §85d's stated reason for retrying this ("tested on an unstabilized foundation
+# before §84a-b's EMA_DECAY fix") does NOT actually apply here - §86 (this
+# session) directly confirmed V_EMA_DECAY=0.99 never diverges on THIS 8x8
+# grid (unlike the 20x20 maze gridworld_hierarchical.py uses). The REAL
+# reason to redo this: §86 also showed the 4000-step budget used throughout
+# §78-83 was UNDERTRAINED on this grid - 30000 steps reaches ~93-95%
+# (decay-independent) instead of 67.7%/75.6%. §83's "marginal gate benefit"
+# may simply be an artifact of testing the gate against a noisy, undertrained
+# baseline that had more obvious room for a gate to catch. Question: does the
+# gate still help anything once the baseline itself is near-ceiling and
+# low-variance?
+
+if __name__ == "__main__" and "--retrained-v" in __import__("sys").argv:
+    SEEDS = [0, 1, 2]
+    results = {"detour": [], "no_detour": [], "real_calls": []}
+    baseline_detour, baseline_no_detour = [], []
+    for seed in SEEDS:
+        print(f"\n{'='*20} seed={seed} {'='*20}")
+        world_model, best_steps, best_acc = train_world_model_validated(seed)
+        train_pairs, test_pairs = make_pair_split(seed)
+        V = train_value_held_out(world_model, train_pairs, seed, steps=30000)  # §86 fix, was 4000
+        gate, threshold = train_gate(world_model, seed)
+
+        test_pairs_list = list(test_pairs)
+        # Stage B baseline (no gate) on this properly-trained V, for an apples-to-apples delta.
+        from gridworld_value_jepa_integrated import plan_stage_b
+        from gridworld_fixes import eval_on_pairs
+        bd_rate, bd_n, bnd_rate, bnd_n = eval_on_pairs(plan_stage_b, world_model, V, test_pairs_list)
+        baseline_detour.append(bd_rate * 100)
+        baseline_no_detour.append(bnd_rate * 100)
+        print(f"  Stage B baseline (retrained V, no gate): detour={bd_rate*100:.1f}% no-detour={bnd_rate*100:.1f}%")
+
+        d_rate, d_n, d_calls, nd_rate, nd_n, nd_calls = eval_hybrid(
+            world_model, V, gate, threshold, test_pairs_list
+        )
+        print(f"  Hybrid (gate-guided, retrained V) on HELD-OUT pairs: detour={d_rate*100:.1f}% (n={d_n}, "
+              f"avg real-env calls/episode={d_calls:.1f}), no-detour={nd_rate*100:.1f}% "
+              f"(n={nd_n}, avg calls={nd_calls:.1f})")
+        results["detour"].append(d_rate * 100)
+        results["no_detour"].append(nd_rate * 100)
+        results["real_calls"].append((d_calls + nd_calls) / 2)
+
+    print(f"\n{'='*70}")
+    print("SUMMARY (§89) - retrained V (30000 steps), 3 seeds, held-out")
+    print(f"{'='*70}")
+
+    def stats(vals):
+        return statistics.mean(vals), (statistics.stdev(vals) if len(vals) > 1 else 0.0), min(vals)
+
+    bm, bs, bw = stats(baseline_detour)
+    print(f"Stage B baseline (no gate) detour:    {bm:5.1f}%+/-{bs:4.1f} (worst {bw:.1f}%)")
+    bm, bs, bw = stats(baseline_no_detour)
+    print(f"Stage B baseline (no gate) no-detour: {bm:5.1f}%+/-{bs:4.1f} (worst {bw:.1f}%)")
+    for key in ["detour", "no_detour"]:
+        vals = results[key]
+        mean, sd, worst = stats(vals)
+        print(f"hybrid {key:<12} {mean:5.1f}% +/- {sd:4.1f}  (per-seed: {[f'{v:.1f}' for v in vals]}, worst={worst:.1f}%)")
+    print(f"\navg real-env calls/episode spent by hybrid: {statistics.mean(results['real_calls']):.1f}")
+    print("For reference, §83's original (undertrained V, 4000 steps):")
+    print("  Stage B baseline: detour=67.7%+/-17.3 (worst 49.0%)  no-detour=75.6%+/-14.1 (worst 62.3%)")
+    print("  Hybrid: detour=70.1%+/-20.0 (worst 48.2%)  no-detour (not reported in §83 memory, +1.8pp similar)")
