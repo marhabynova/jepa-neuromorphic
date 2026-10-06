@@ -501,3 +501,83 @@ if __name__ == "__main__" and "--hierarchical" in __import__("sys").argv:
     print(f"\n{'='*60}")
     print("Flat planner (same seed, already measured): see --flat-baseline output")
     print("Prediction: hierarchical cliff should appear much further out (~K=5x) than flat's.")
+
+
+# ---------- §84e: multi-seed + held-out validation of the core claim ----------
+# (flat wins short-range, hierarchical wins long-range 20-34), per the
+# established §81-82 protocol (held-out pairs, multi-seed, exact-VI ceiling)
+# that hadn't been applied to this maze yet.
+
+def make_pair_split_maze(seed, test_frac=0.2, n_sample_pairs=4000):
+    """Full pair space here is far bigger (352 free cells) than the 8x8
+    grid's - subsample a candidate pool first, then split, to keep this
+    tractable."""
+    rng = np.random.default_rng(seed + 500)
+    pairs = []
+    attempts = 0
+    while len(pairs) < n_sample_pairs and attempts < n_sample_pairs * 3:
+        s = random_free_cell(rng); g = random_free_cell(rng)
+        attempts += 1
+        if s != g:
+            pairs.append((s, g))
+    rng.shuffle(pairs)
+    n_test = int(len(pairs) * test_frac)
+    return pairs[n_test:], pairs[:n_test]
+
+
+if __name__ == "__main__" and "--validate" in __import__("sys").argv:
+    import statistics
+    from collections import defaultdict
+
+    SEEDS = [0, 1, 2]
+    LONG_RANGE = (20, 34)  # the core claim's regime
+
+    flat_long, hi_long = [], []
+    flat_short, hi_short = [], []
+
+    for seed in SEEDS:
+        print(f"\n{'='*20} seed={seed} {'='*20}")
+        wm = train_world_model(seed=seed)
+        train_pairs, test_pairs = make_pair_split_maze(seed)
+
+        V_prim = train_primitive_value(wm, seed=seed)
+        V_hi = train_hi_value(wm, seed=seed)
+
+        # Evaluate on HELD-OUT pairs only, stratified by true distance
+        flat_by_bucket = defaultdict(lambda: [0, 0])
+        hi_by_bucket = defaultdict(lambda: [0, 0])
+        for s, g in test_pairs:
+            d = bfs_optimal_distance(s, g)
+            bucket = "long" if LONG_RANGE[0] <= d <= LONG_RANGE[1] else ("short" if d < 10 else None)
+            if bucket is None:
+                continue
+            _, freached = flat_plan(wm, V_prim, s, g)
+            _, hreached = hierarchical_plan(wm, V_hi, s, g)
+            flat_by_bucket[bucket][1] += 1
+            hi_by_bucket[bucket][1] += 1
+            if freached: flat_by_bucket[bucket][0] += 1
+            if hreached: hi_by_bucket[bucket][0] += 1
+
+        f_long = flat_by_bucket["long"][0] / max(flat_by_bucket["long"][1], 1)
+        h_long = hi_by_bucket["long"][0] / max(hi_by_bucket["long"][1], 1)
+        f_short = flat_by_bucket["short"][0] / max(flat_by_bucket["short"][1], 1)
+        h_short = hi_by_bucket["short"][0] / max(hi_by_bucket["short"][1], 1)
+        print(f"  HELD-OUT short (dist<10): flat={f_short*100:.1f}% (n={flat_by_bucket['short'][1]}) "
+              f"hierarchical={h_short*100:.1f}% (n={hi_by_bucket['short'][1]})")
+        print(f"  HELD-OUT long (dist 20-34): flat={f_long*100:.1f}% (n={flat_by_bucket['long'][1]}) "
+              f"hierarchical={h_long*100:.1f}% (n={hi_by_bucket['long'][1]})")
+        flat_long.append(f_long * 100); hi_long.append(h_long * 100)
+        flat_short.append(f_short * 100); hi_short.append(h_short * 100)
+
+    print(f"\n{'='*70}")
+    print("SUMMARY across 3 seeds, HELD-OUT pairs only")
+    print(f"{'='*70}")
+    def stats(vals):
+        return statistics.mean(vals), (statistics.stdev(vals) if len(vals) > 1 else 0.0), min(vals)
+    fm, fs, fw = stats(flat_short); hm, hs, hw = stats(hi_short)
+    print(f"SHORT (dist<10):  flat={fm:.1f}%+/-{fs:.1f} (worst {fw:.1f}%)   "
+          f"hierarchical={hm:.1f}%+/-{hs:.1f} (worst {hw:.1f}%)")
+    fm, fs, fw = stats(flat_long); hm, hs, hw = stats(hi_long)
+    print(f"LONG (dist 20-34): flat={fm:.1f}%+/-{fs:.1f} (worst {fw:.1f}%)   "
+          f"hierarchical={hm:.1f}%+/-{hs:.1f} (worst {hw:.1f}%)")
+    print(f"\nExact-VI ceiling (zero learning): 100% on every pair, always (reference).")
