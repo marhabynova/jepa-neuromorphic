@@ -390,7 +390,7 @@ def train_jump_dynamics(world_model, seed=SEED, steps=WM_STEPS):
     return jump_dyn
 
 
-def train_hi_value(world_model, seed=SEED, steps=V_STEPS):
+def train_hi_value(world_model, seed=SEED, steps=V_STEPS, k=K):
     """TD/Bellman over JUMP transitions - step cost is the ACTUAL number
     of primitive steps the jump covered (not always K, since walls clip
     it early), not a flat 1 like the primitive value function."""
@@ -414,7 +414,7 @@ def train_hi_value(world_model, seed=SEED, steps=V_STEPS):
         with torch.no_grad():
             best_next_v = torch.full((V_BATCH_SIZE,), float("inf"), device=DEVICE)
             for o in range(N_OPTIONS):
-                jumped = [jump_step_env(s[0], s[1], o, goal=g) for s, g in zip(states, goals)]
+                jumped = [jump_step_env(s[0], s[1], o, k=k, goal=g) for s, g in zip(states, goals)]
                 nxs = [j[0] for j in jumped]; nys = [j[1] for j in jumped]; jcosts = torch.tensor(
                     [float(j[2]) for j in jumped], device=DEVICE)
                 next_repr = ctx_batch(world_model, nxs, nys)
@@ -436,7 +436,7 @@ def train_hi_value(world_model, seed=SEED, steps=V_STEPS):
     return V_hi
 
 
-def hierarchical_plan(world_model, V_hi, start, goal, max_macro_steps=40, memory=3):
+def hierarchical_plan(world_model, V_hi, start, goal, max_macro_steps=40, memory=3, k=K):
     """Macro-level: pick the best OPTION via V_hi (using JumpDynamics-free
     exact jump simulation for scoring - grounded, like plan_stage_a, not
     plan_stage_b's pure imagination, since we're isolating "does chunking
@@ -459,7 +459,7 @@ def hierarchical_plan(world_model, V_hi, start, goal, max_macro_steps=40, memory
             return path, True
         scored = []
         for o in range(N_OPTIONS):
-            nx, ny, cost = jump_step_env(x, y, o, goal=goal)
+            nx, ny, cost = jump_step_env(x, y, o, k=k, goal=goal)
             next_repr = ctx(world_model, nx, ny)
             v = V_hi(next_repr.unsqueeze(0), g_repr.unsqueeze(0)).item()
             score = cost + v
@@ -581,3 +581,91 @@ if __name__ == "__main__" and "--validate" in __import__("sys").argv:
     print(f"LONG (dist 20-34): flat={fm:.1f}%+/-{fs:.1f} (worst {fw:.1f}%)   "
           f"hierarchical={hm:.1f}%+/-{hs:.1f} (worst {hw:.1f}%)")
     print(f"\nExact-VI ceiling (zero learning): 100% on every pair, always (reference).")
+
+
+# ---------- §87: K sweep - does the option length control the short/long trade-off? ----------
+# Mechanism hypothesis, grounded directly in §84e's own explanation of WHY
+# hierarchical wins long-range and loses short-range: K=5 jumps are "coarse/
+# overkill for nearby goals" (short-range cost) but give "fewer macro-decisions
+# = less compounding error" (long-range benefit). If that mechanism is real,
+# a SMALLER K (3) should narrow the short-range cost (finer jumps, less
+# overkill) at some expense of the long-range win (more macro-decisions per
+# real distance again); a LARGER K (8) should do the reverse - worse
+# short-range, stronger long-range. This is a targeted test of the stated
+# mechanism, not a blind parameter sweep.
+#
+# Efficiency note: flat_plan/V_prim and the world model are K-INDEPENDENT -
+# trained once per seed and reused across all K values, so only V_hi needs
+# retraining per K. hierarchical_plan never calls the learned jump_dyn (it
+# scores options via exact jump_step_env simulation, same as plan_stage_a's
+# grounding discipline) so jump_dyn is skipped entirely here too, matching
+# what §84e's own --validate block already does.
+
+if __name__ == "__main__" and "--k-sweep" in __import__("sys").argv:
+    import statistics
+    from collections import defaultdict
+
+    SEEDS = [0, 1, 2]
+    LONG_RANGE = (20, 34)
+    K_VALUES = [3, 5, 8]
+
+    flat_short_by_seed, flat_long_by_seed = [], []
+    hi_short = {k: [] for k in K_VALUES}
+    hi_long = {k: [] for k in K_VALUES}
+
+    for seed in SEEDS:
+        print(f"\n{'='*20} seed={seed} {'='*20}")
+        wm = train_world_model(seed=seed)
+        train_pairs, test_pairs = make_pair_split_maze(seed)
+        V_prim = train_primitive_value(wm, seed=seed)
+
+        flat_by_bucket = defaultdict(lambda: [0, 0])
+        for s, g in test_pairs:
+            d = bfs_optimal_distance(s, g)
+            bucket = "long" if LONG_RANGE[0] <= d <= LONG_RANGE[1] else ("short" if d < 10 else None)
+            if bucket is None:
+                continue
+            _, freached = flat_plan(wm, V_prim, s, g)
+            flat_by_bucket[bucket][1] += 1
+            if freached: flat_by_bucket[bucket][0] += 1
+        f_short = flat_by_bucket["short"][0] / max(flat_by_bucket["short"][1], 1)
+        f_long = flat_by_bucket["long"][0] / max(flat_by_bucket["long"][1], 1)
+        flat_short_by_seed.append(f_short * 100)
+        flat_long_by_seed.append(f_long * 100)
+        print(f"  flat (K-independent): short={f_short*100:.1f}% (n={flat_by_bucket['short'][1]}) "
+              f"long={f_long*100:.1f}% (n={flat_by_bucket['long'][1]})")
+
+        for k in K_VALUES:
+            V_hi = train_hi_value(wm, seed=seed, k=k)
+            hi_by_bucket = defaultdict(lambda: [0, 0])
+            for s, g in test_pairs:
+                d = bfs_optimal_distance(s, g)
+                bucket = "long" if LONG_RANGE[0] <= d <= LONG_RANGE[1] else ("short" if d < 10 else None)
+                if bucket is None:
+                    continue
+                _, hreached = hierarchical_plan(wm, V_hi, s, g, k=k)
+                hi_by_bucket[bucket][1] += 1
+                if hreached: hi_by_bucket[bucket][0] += 1
+            h_short = hi_by_bucket["short"][0] / max(hi_by_bucket["short"][1], 1)
+            h_long = hi_by_bucket["long"][0] / max(hi_by_bucket["long"][1], 1)
+            hi_short[k].append(h_short * 100)
+            hi_long[k].append(h_long * 100)
+            print(f"  K={k}: hierarchical short={h_short*100:.1f}% (n={hi_by_bucket['short'][1]}) "
+                  f"long={h_long*100:.1f}% (n={hi_by_bucket['long'][1]})")
+
+    def stats(vals):
+        return statistics.mean(vals), (statistics.stdev(vals) if len(vals) > 1 else 0.0), min(vals)
+
+    print(f"\n{'='*70}")
+    print("K-SWEEP SUMMARY across 3 seeds, HELD-OUT pairs only")
+    print(f"{'='*70}")
+    fm, fs, fw = stats(flat_short_by_seed)
+    print(f"flat SHORT (dist<10):   {fm:.1f}%+/-{fs:.1f} (worst {fw:.1f}%)  [K-independent, same for every row below]")
+    fm, fs, fw = stats(flat_long_by_seed)
+    print(f"flat LONG (dist 20-34): {fm:.1f}%+/-{fs:.1f} (worst {fw:.1f}%)  [K-independent]")
+    for k in K_VALUES:
+        hm, hs, hw = stats(hi_short[k])
+        print(f"hierarchical K={k} SHORT:  {hm:.1f}%+/-{hs:.1f} (worst {hw:.1f}%)")
+    for k in K_VALUES:
+        hm, hs, hw = stats(hi_long[k])
+        print(f"hierarchical K={k} LONG:   {hm:.1f}%+/-{hs:.1f} (worst {hw:.1f}%)")
