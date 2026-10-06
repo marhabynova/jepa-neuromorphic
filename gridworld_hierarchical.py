@@ -669,3 +669,78 @@ if __name__ == "__main__" and "--k-sweep" in __import__("sys").argv:
     for k in K_VALUES:
         hm, hs, hw = stats(hi_long[k])
         print(f"hierarchical K={k} LONG:   {hm:.1f}%+/-{hs:.1f} (worst {hw:.1f}%)")
+
+
+# ---------- §90: foundation check for a 3rd hierarchy level - does the compounding-error ----------
+# cliff just get pushed out (not eliminated) by the 2-level (K=2) planner,
+# the same way it was pushed out by going from flat to 2-level in the first
+# place (§84)? Every LONG-range number so far (§84e/§87/§87a/§89) only
+# covered dist 20-34 - this maze's actual max BFS distance is 72. If the
+# K=2-hierarchical planner is already near-ceiling out to 72, there's no
+# real room for a 3rd level; if it craters somewhere before 72, that's
+# concrete, precise evidence for where a 3rd level should target - the
+# same "don't build hierarchy machinery for a problem that doesn't need it"
+# discipline (§81b) that originally justified building level 2 at all.
+
+if __name__ == "__main__" and "--full-range-check" in __import__("sys").argv:
+    import statistics
+
+    SEEDS = [0, 1, 2]
+    BUCKETS = [(0, 9), (10, 19), (20, 29), (30, 39), (40, 49), (50, 59), (60, 72)]
+
+    def bucket_of(d):
+        for lo, hi in BUCKETS:
+            if lo <= d <= hi:
+                return (lo, hi)
+        return None
+
+    flat_by_bucket = {b: [] for b in BUCKETS}
+    hi_by_bucket = {b: [] for b in BUCKETS}
+
+    for seed in SEEDS:
+        print(f"\n{'='*20} seed={seed} {'='*20}")
+        wm = train_world_model(seed=seed)
+        train_pairs, test_pairs = make_pair_split_maze(seed, n_sample_pairs=6000)
+        V_prim = train_primitive_value(wm, seed=seed)
+        V_hi = train_hi_value(wm, seed=seed, k=2)
+
+        counts = {b: [0, 0] for b in BUCKETS}
+        hi_counts = {b: [0, 0] for b in BUCKETS}
+        dist_seen = []
+        for s, g in test_pairs:
+            d = bfs_optimal_distance(s, g)
+            if d is None:
+                continue
+            dist_seen.append(d)
+            b = bucket_of(d)
+            if b is None:
+                continue
+            _, freached = flat_plan(wm, V_prim, s, g)
+            _, hreached = hierarchical_plan(wm, V_hi, s, g, k=2)
+            counts[b][1] += 1
+            hi_counts[b][1] += 1
+            if freached: counts[b][0] += 1
+            if hreached: hi_counts[b][0] += 1
+
+        print(f"  max dist seen in held-out sample: {max(dist_seen)}")
+        for b in BUCKETS:
+            n = counts[b][1]
+            if n == 0:
+                continue
+            f_rate = counts[b][0] / n
+            h_rate = hi_counts[b][0] / n
+            flat_by_bucket[b].append(f_rate * 100)
+            hi_by_bucket[b].append(h_rate * 100)
+            print(f"  dist {b[0]:>2}-{b[1]:<2} (n={n:>4}): flat={f_rate*100:5.1f}%  K=2-hierarchical={h_rate*100:5.1f}%")
+
+    print(f"\n{'='*70}")
+    print("FULL-RANGE SUMMARY (3-seed, held-out) - flat vs K=2 hierarchical")
+    print(f"{'='*70}")
+    for b in BUCKETS:
+        if not flat_by_bucket[b]:
+            print(f"dist {b[0]:>2}-{b[1]:<2}: no samples in any seed")
+            continue
+        fvals, hvals = flat_by_bucket[b], hi_by_bucket[b]
+        fm = statistics.mean(fvals); fsd = statistics.stdev(fvals) if len(fvals) > 1 else 0.0
+        hm = statistics.mean(hvals); hsd = statistics.stdev(hvals) if len(hvals) > 1 else 0.0
+        print(f"dist {b[0]:>2}-{b[1]:<2}: flat={fm:5.1f}%+/-{fsd:4.1f}   K=2-hierarchical={hm:5.1f}%+/-{hsd:4.1f}   (n_seeds={len(fvals)})")
