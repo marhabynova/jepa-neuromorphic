@@ -607,7 +607,7 @@ if __name__ == "__main__" and "--k-sweep" in __import__("sys").argv:
 
     SEEDS = [0, 1, 2]
     LONG_RANGE = (20, 34)
-    K_VALUES = [3, 5, 8]
+    K_VALUES = [1, 2, 3, 5, 8]  # 1,2 added after §87's initial 3/5/8 sweep revealed a non-monotonic curve, not a clean trade-off
 
     flat_short_by_seed, flat_long_by_seed = [], []
     hi_short = {k: [] for k in K_VALUES}
