@@ -281,22 +281,32 @@ def train_primitive_value(world_model, seed=SEED, steps=V_STEPS):
     return V
 
 
-def flat_plan(world_model, V, start, goal, max_steps=100):
+def flat_plan(world_model, V, start, goal, max_steps=100, memory=3):
+    """FAIRNESS FIX (found via direct user crosscheck): this planner had
+    the SAME stuck/cycling vulnerability as the original hierarchical_plan
+    (measured: 62.3% of its steps were zero-progress, mean step length in
+    failed episodes only 0.342) but was never given the anti-stuck memory
+    fix applied to hierarchical_plan in §84c - an unfair, confounded
+    comparison (hierarchical got a bug fix flat didn't). Same tabu-memory
+    pattern applied here for an apples-to-apples comparison."""
     x, y = start
     path = [(x, y)]
+    recent = [(x, y)]
     g_repr = tgt(world_model, *goal)
     for _ in range(max_steps):
         if (x, y) == goal:
             return path, True
-        best_a, best_v = None, float("inf")
+        scored = []
         for a in range(N_ACTIONS):
             nx, ny = step_env(x, y, a)
             next_repr = ctx(world_model, nx, ny)
             v = V(next_repr.unsqueeze(0), g_repr.unsqueeze(0)).item()
-            if v < best_v:
-                best_v, best_a = v, a
-        x, y = step_env(x, y, best_a)
+            stuck = (nx, ny) == (x, y) or (nx, ny) in recent[-memory:]
+            scored.append((stuck, v, (nx, ny)))
+        scored.sort(key=lambda t: (t[0], t[1]))
+        _, _, (x, y) = scored[0]
         path.append((x, y))
+        recent.append((x, y))
     return path, (x, y) == goal
 
 
