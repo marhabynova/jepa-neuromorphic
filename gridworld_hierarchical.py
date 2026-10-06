@@ -426,31 +426,39 @@ def train_hi_value(world_model, seed=SEED, steps=V_STEPS):
     return V_hi
 
 
-def hierarchical_plan(world_model, V_hi, start, goal, max_macro_steps=40):
+def hierarchical_plan(world_model, V_hi, start, goal, max_macro_steps=40, memory=3):
     """Macro-level: pick the best OPTION via V_hi (using JumpDynamics-free
     exact jump simulation for scoring - grounded, like plan_stage_a, not
     plan_stage_b's pure imagination, since we're isolating "does chunking
     into K-step jumps help" from "does imagined multi-step lookahead
-    survive" (a separate question already explored in §79/§80)."""
+    survive" (a separate question already explored in §79/§80).
+
+    ANTI-STUCK MEMORY (3rd bug found - measured jump-length distribution
+    directly: 96.7% of jumps were length<=1, mean jump length in FAILED
+    episodes was 0.09 (essentially zero movement) vs 3.50 in successful
+    ones. V_hi sometimes keeps scoring a wall-blocked (zero-progress)
+    option as "best", and with no memory the planner repeats it for
+    every remaining macro-step, burning the whole budget stuck. Same
+    fix pattern already proven for the primitive planner in §76c."""
     x, y = start
     path = [(x, y)]
+    recent = [(x, y)]
     g_repr = tgt(world_model, *goal)
     for _ in range(max_macro_steps):
         if (x, y) == goal:
             return path, True
-        best_o, best_score = None, float("inf")
+        scored = []
         for o in range(N_OPTIONS):
             nx, ny, cost = jump_step_env(x, y, o, goal=goal)
             next_repr = ctx(world_model, nx, ny)
             v = V_hi(next_repr.unsqueeze(0), g_repr.unsqueeze(0)).item()
             score = cost + v
-            if score < best_score:
-                best_score, best_o = score, o
-        x, y, _ = jump_step_env(x, y, best_o, goal=goal)  # FIX: was missing goal= here -
-        # scoring correctly anticipated stopping at the goal, but EXECUTION still jumped
-        # the full K and overshot - found by re-checking logic after a user prompt to
-        # look for undetected bugs, not from a failing metric alone.
+            stuck = (nx, ny) == (x, y) or (nx, ny) in recent[-memory:]
+            scored.append((stuck, score, (nx, ny)))
+        scored.sort(key=lambda t: (t[0], t[1]))  # prefer non-stuck, then lowest score
+        _, _, (x, y) = scored[0]
         path.append((x, y))
+        recent.append((x, y))
     return path, (x, y) == goal
 
 
