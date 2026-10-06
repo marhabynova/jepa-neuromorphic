@@ -234,10 +234,10 @@ class ValueNet(nn.Module):
         return self.net(torch.cat([state_repr, goal_repr], dim=-1)).squeeze(-1)
 
 
-V_STEPS = 6000
+V_STEPS = 30000  # needs the longer horizon now that training is stable, not divergent
 V_LR = 1e-3
 V_BATCH_SIZE = 128
-V_EMA_DECAY = 0.99
+V_EMA_DECAY = 0.999  # FIX (diagnosed §84a): 0.99 diverges catastrophically past ~21k steps on this larger maze; 0.999 stabilizes training completely (corr 0.03->0.70)
 
 
 def train_primitive_value(world_model, seed=SEED, steps=V_STEPS):
@@ -446,7 +446,10 @@ def hierarchical_plan(world_model, V_hi, start, goal, max_macro_steps=40):
             score = cost + v
             if score < best_score:
                 best_score, best_o = score, o
-        x, y, _ = jump_step_env(x, y, best_o)
+        x, y, _ = jump_step_env(x, y, best_o, goal=goal)  # FIX: was missing goal= here -
+        # scoring correctly anticipated stopping at the goal, but EXECUTION still jumped
+        # the full K and overshot - found by re-checking logic after a user prompt to
+        # look for undetected bugs, not from a failing metric alone.
         path.append((x, y))
     return path, (x, y) == goal
 
