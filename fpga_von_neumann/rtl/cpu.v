@@ -12,6 +12,16 @@ module cpu (
     output reg [31:0] mmio_out,
     output             mmio_valid
 );
+    // §68/§74: imem/dmem reads became SYNCHRONOUS (1-cycle latency, the
+    // timing real FPGA block RAM has) so yosys's memory_bram pass can infer
+    // real BRAM instead of flattening them into individual flip-flops
+    // (§68 found that flattening alone exceeded an iCE40 UP5K's whole LUT
+    // budget). That retired the old single-cycle datapath: this is now a
+    // small FETCH/EXEC/MEM FSM instead. Nothing overlaps (no pipelining),
+    // so there are no hazards to handle - just an explicit 1-cycle wait
+    // after presenting an address, before using what comes back.
+    localparam S_FETCH = 2'd0, S_EXEC = 2'd1, S_MEM = 2'd2;
+    reg [1:0] state;
     reg [31:0] pc;
     wire [31:0] instr;
 
@@ -47,11 +57,21 @@ module cpu (
         endcase
     end
 
+    // `instr` (and everything decoded from it) stays stable across EXEC and
+    // MEM, because `pc` - imem's read address - only changes on the edge
+    // that returns to FETCH. `returning_to_fetch` marks exactly that edge:
+    // EXEC->FETCH for everything except loads, MEM->FETCH for loads. Every
+    // other transition (FETCH->EXEC, EXEC->MEM) holds pc so addresses stay
+    // valid for memory that's still catching up to a synchronous read.
+    wire returning_to_fetch = (state == S_EXEC && !mem_to_reg) || (state == S_MEM);
+    wire reg_write_now = reg_write && returning_to_fetch;
+    wire exec_now = (state == S_EXEC);
+
     wire [31:0] rd_data1, rd_data2;
     wire [31:0] wb_data;
 
     regfile rf (
-        .clk(clk), .we(reg_write),
+        .clk(clk), .we(reg_write_now),
         .rd_addr1(rs1), .rd_addr2(rs2), .wr_addr(rd),
         .wr_data(wb_data),
         .rd_data1(rd_data1), .rd_data2(rd_data2)
@@ -61,7 +81,12 @@ module cpu (
     wire [31:0] alu_result;
     alu alu_u (.a(rd_data1), .b(alu_b), .op(alu_op), .result(alu_result));
 
-    wire mmio_sel = mem_write && (alu_result[31:24] == 8'hFF);
+    // Gated by exec_now (§74 fix): without it, mem_write/mmio_sel would
+    // stay combinationally true for one extra S_FETCH cycle too (instr -
+    // and everything decoded from it - doesn't update until the NEXT
+    // FETCH->EXEC edge), causing a harmless-but-wrong duplicate dmem write
+    // and a second mmio_valid pulse for the same logical store.
+    wire mmio_sel = mem_write && exec_now && (alu_result[31:24] == 8'hFF);
     assign mmio_valid = mmio_sel;
 
     always @(posedge clk or posedge rst) begin
@@ -74,7 +99,7 @@ module cpu (
     wire [31:0] dmem_rd;
     dmem dmem_u (
         .clk(clk), .addr(alu_result), .wr_data(rd_data2),
-        .we(mem_write && !mmio_sel), .rd_data(dmem_rd)
+        .we(mem_write && exec_now && !mmio_sel), .rd_data(dmem_rd)
     );
 
     wire [31:0] pc_plus4 = pc + 32'd4;
@@ -100,12 +125,23 @@ module cpu (
 
     wire [31:0] pc_next = (jump || branch_taken) ? (pc + imm) : pc_plus4;
 
-    imem imem_u (.addr(pc), .instr(instr));
+    imem imem_u (.clk(clk), .addr(pc), .instr(instr));
 
     always @(posedge clk or posedge rst) begin
-        if (rst)
+        if (rst) begin
+            state <= S_FETCH;
             pc <= 32'd0;
-        else
-            pc <= pc_next;
+        end else begin
+            case (state)
+                S_FETCH: state <= S_EXEC;
+                S_EXEC:  state <= mem_to_reg ? S_MEM : S_FETCH; // loads need 1 more cycle
+                S_MEM:   state <= S_FETCH;
+                default: state <= S_FETCH;
+            endcase
+            if (returning_to_fetch)
+                pc <= pc_next;
+            // else: hold pc - FETCH->EXEC and EXEC->MEM keep the address
+            // stable for memory that's still catching up.
+        end
     end
 endmodule

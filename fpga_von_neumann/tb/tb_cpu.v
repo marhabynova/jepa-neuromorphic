@@ -25,7 +25,12 @@ module tb_cpu;
         rst = 1;
         #12 rst = 0;
 
-        #400; // ~22 instructions need ~22 cycles; this gives plenty of margin
+        // §74: each instruction now takes 2 cycles (FETCH+EXEC) or 3 (LOAD,
+        // +MEM), not 1 - the FSM replaced the old single-cycle datapath once
+        // imem/dmem reads became synchronous. 28 instructions * ~2.1 cycles
+        // avg + the halt loop's own 2-cycle-per-iteration overhead -> needs
+        // comfortably more margin than the old #400.
+        #1200;
 
         $display("x1  = %0d (expect 5)",              dut.rf.regs[1]);
         $display("x2  = %0d (expect 10)",              dut.rf.regs[2]);
