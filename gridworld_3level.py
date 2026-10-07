@@ -171,7 +171,7 @@ class RegionValueNet(nn.Module):
         return self.net(torch.cat([state_repr, goal_repr], dim=-1)).squeeze(-1)
 
 
-L3_TD_STEPS = 8000
+L3_TD_STEPS = 30000  # was 8000 - §91a found this undertrained per §86's exact EMA_DECAY/step-budget pairing lesson
 L3_LR = 1e-3
 L3_BATCH = 32
 L3_EMA_DECAY = 0.999  # §86's lesson applied from the start here, not discovered the hard way again
@@ -180,7 +180,7 @@ L3_EMA_DECAY = 0.999  # §86's lesson applied from the start here, not discovere
 DIRECTIONS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 
 
-def train_region_value(world_model, dataset, seed):
+def train_region_value(world_model, dataset, seed, steps=L3_TD_STEPS):
     """TD/Bellman training over the FIXED dataset. BUG FOUND AND FIXED
     DURING THIS SESSION before this version: an earlier draft regressed
     directly onto whichever single random dataset row got sampled, with NO
@@ -209,7 +209,7 @@ def train_region_value(world_model, dataset, seed):
     for d in dataset:
         grouped[d["source_region"]][d["target_region"]].append((d["cost"], d["arrival_region"]))
 
-    for step in range(L3_TD_STEPS):
+    for step in range(steps):
         source_regions = [ALL_REGIONS[i] for i in rng.integers(0, len(ALL_REGIONS), size=L3_BATCH)]
         goal_regions = [ALL_REGIONS[i] for i in rng.integers(0, len(ALL_REGIONS), size=L3_BATCH)]
         state_repr = torch.stack([region_repr[r] for r in source_regions])
@@ -256,7 +256,7 @@ def train_region_value(world_model, dataset, seed):
             for p_t, p in zip(V3_target.parameters(), V3.parameters()):
                 p_t.data.mul_(L3_EMA_DECAY).add_(p.data, alpha=1 - L3_EMA_DECAY)
         if (step + 1) % 1000 == 0:
-            print(f"  [V-level3] step {step+1}/{L3_TD_STEPS} loss={loss.item():.4f}")
+            print(f"  [V-level3] step {step+1}/{steps} loss={loss.item():.4f}")
     return V3, region_repr, region_tgt_repr
 
 
@@ -305,12 +305,12 @@ def bucket_of(d):
     return None
 
 
-def run_one_seed(seed):
+def run_one_seed(seed, l3_steps=L3_TD_STEPS):
     wm = gh.train_world_model(seed=seed)
     V_hi = gh.train_hi_value(wm, seed=seed, k=2)
     V_prim = gh.train_primitive_value(wm, seed=seed)
     dataset = collect_region_transitions(wm, V_hi, seed)
-    V3, region_repr, region_tgt_repr = train_region_value(wm, dataset, seed)
+    V3, region_repr, region_tgt_repr = train_region_value(wm, dataset, seed, steps=l3_steps)
 
     train_pairs, test_pairs = gh.make_pair_split_maze(seed, n_sample_pairs=6000)
     counts = {b: {"flat": [0, 0], "l2": [0, 0], "l3": [0, 0]} for b in BUCKETS}
