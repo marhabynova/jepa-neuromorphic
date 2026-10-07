@@ -8,6 +8,8 @@ module control (
     output       alu_src,
     output       branch,
     output       jump,
+    output       jalr,
+    output       lui,
     output [3:0] alu_op
 );
     localparam OP_RTYPE  = 7'b0110011;
@@ -16,8 +18,10 @@ module control (
     localparam OP_STORE  = 7'b0100011;
     localparam OP_BRANCH = 7'b1100011;
     localparam OP_JAL    = 7'b1101111;
+    localparam OP_JALR   = 7'b1100111;
+    localparam OP_LUI    = 7'b0110111;
 
-    reg rw, mw, m2r, asrc, br, jp;
+    reg rw, mw, m2r, asrc, br, jp, jr, lu;
     reg [3:0] aop;
 
     assign reg_write  = rw;
@@ -26,13 +30,19 @@ module control (
     assign alu_src    = asrc;
     assign branch     = br;
     assign jump       = jp;
+    assign jalr       = jr;
+    assign lui        = lu;
     assign alu_op     = aop;
 
     // v2 scope: ADD/SUB/AND/OR/XOR/SLT/SLL/SRL (R-type), ADDI/ANDI/ORI (I-type),
     // LW, SW, BEQ/BNE/BLT/BGE (cpu.v has a dedicated comparator - see there),
-    // JAL. SRA, BLTU/BGEU, and the rest of RV32I are still TODO.
+    // JAL. v3 adds JALR (real function-call/return convention - without it,
+    // no subroutine could return to a dynamic caller, only to a fixed
+    // offset) and LUI (build a 32-bit constant in 2 instructions instead of
+    // the addi+sll shift trick asm.py used everywhere before this).
+    // SRA, BLTU/BGEU, MUL/DIV, AUIPC, and the rest of RV32I are still TODO.
     always @(*) begin
-        rw = 0; mw = 0; m2r = 0; asrc = 0; br = 0; jp = 0; aop = 4'b0000;
+        rw = 0; mw = 0; m2r = 0; asrc = 0; br = 0; jp = 0; jr = 0; lu = 0; aop = 4'b0000;
 
         case (opcode)
             OP_RTYPE: begin
@@ -71,6 +81,19 @@ module control (
             end
             OP_JAL: begin
                 rw = 1; jp = 1;
+            end
+            OP_JALR: begin
+                // rd <= pc+4 (same as JAL, cpu.v's wb_data mux already
+                // handles that via `jump`); target computed via the ALU
+                // path (rs1 + I-type imm) instead of pc+imm, so asrc=1
+                // routes alu_b=imm and aop=ADD gives alu_result=rs1+imm -
+                // cpu.v's pc_next mux picks this up via the new `jalr` signal.
+                rw = 1; asrc = 1; jp = 1; jr = 1; aop = 4'b0000;
+            end
+            OP_LUI: begin
+                // rd <= imm_u (top 20 bits, bottom 12 zero) - no ALU
+                // involvement needed, cpu.v routes this straight through.
+                rw = 1; lu = 1;
             end
             default: begin
                 // unimplemented opcode: all control signals stay at safe defaults (no writes)

@@ -51,20 +51,24 @@ module cpu (
     wire [4:0] rs2    = instr[24:20];
     wire [6:0] funct7 = instr[31:25];
 
-    wire reg_write, mem_write, mem_to_reg, alu_src, branch, jump;
+    wire reg_write, mem_write, mem_to_reg, alu_src, branch, jump, jalr, lui;
     wire [3:0] alu_op;
 
     control ctrl (
         .opcode(opcode), .funct3(funct3), .funct7(funct7),
         .reg_write(reg_write), .mem_write(mem_write), .mem_to_reg(mem_to_reg),
-        .alu_src(alu_src), .branch(branch), .jump(jump), .alu_op(alu_op)
+        .alu_src(alu_src), .branch(branch), .jump(jump), .jalr(jalr), .lui(lui),
+        .alu_op(alu_op)
     );
 
-    // Immediate generation for all formats we use (I/S/B/J), sign-extended.
+    // Immediate generation for all formats we use (I/S/B/J/U), sign-extended
+    // (U-type's bottom 12 bits are architecturally zero, not sign-extended -
+    // LUI just places imm[31:12] directly, no extension needed there).
     wire [31:0] imm_i = {{20{instr[31]}}, instr[31:20]};
     wire [31:0] imm_s = {{20{instr[31]}}, instr[31:25], instr[11:7]};
     wire [31:0] imm_b = {{19{instr[31]}}, instr[31], instr[7], instr[30:25], instr[11:8], 1'b0};
     wire [31:0] imm_j = {{11{instr[31]}}, instr[31], instr[19:12], instr[20], instr[30:21], 1'b0};
+    wire [31:0] imm_u = {instr[31:12], 12'b0};
 
     reg [31:0] imm;
     always @(*) begin
@@ -140,7 +144,10 @@ module cpu (
     wire [31:0] load_data = mmio_region ? mmio_rdata : dmem_rd;
 
     wire [31:0] pc_plus4 = pc + 32'd4;
-    assign wb_data = jump ? pc_plus4 : (mem_to_reg ? load_data : alu_result);
+    // jump covers both JAL and JALR (both write rd<=pc+4, cpu.v's pc_next
+    // mux below is what actually differs between them); lui writes imm_u
+    // directly, no ALU involvement.
+    assign wb_data = jump ? pc_plus4 : (lui ? imm_u : (mem_to_reg ? load_data : alu_result));
 
     // Dedicated branch comparator (separate from the ALU path) so BEQ/BNE/
     // BLT/BGE can all be expressed cleanly from funct3. BLTU/BGEU (unsigned)
@@ -160,7 +167,14 @@ module cpu (
     end
     wire branch_taken = branch && branch_cond;
 
-    wire [31:0] pc_next = (jump || branch_taken) ? (pc + imm) : pc_plus4;
+    // JALR's target is rs1+imm (already computed as alu_result, since
+    // control.v sets asrc=1/aop=ADD for it), with the LSB cleared per the
+    // RV32I spec (RISC-V jump targets are always 2-byte-aligned minimum;
+    // we're 4-byte aligned throughout anyway, this just matches spec).
+    // JAL's target is still pc+imm (PC-relative, no ALU involvement).
+    wire [31:0] jalr_target = {alu_result[31:1], 1'b0};
+    wire [31:0] pc_next = jalr ? jalr_target :
+                          (jump || branch_taken) ? (pc + imm) : pc_plus4;
 
     imem imem_u (.clk(clk), .addr(pc), .instr(instr));
 
