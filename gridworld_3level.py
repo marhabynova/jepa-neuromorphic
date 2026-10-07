@@ -63,6 +63,31 @@ def region_anchor(rx, ry):
     return min(cells, key=lambda c: (c[0] - cx) ** 2 + (c[1] - cy) ** 2)
 
 
+def region_entry_anchor(rx, ry, from_dx, from_dy):
+    """Nearest free cell to the EDGE of this region facing back toward
+    where we're entering from, instead of the region's geometric center.
+    FIX (found via §91's per-pair success-rate breakdown): several regions
+    are internally BISECTED by a wall with no gap in that region's own
+    y-range (e.g. region (3,0): wall x=17 blocks its entire y0-4 span) -
+    the fixed geometric-center anchor can land on the far, disconnected
+    side relative to the entry point, misdirecting V_hi's lookahead toward
+    an unreachable-without-detour point even though the actual SUCCESS
+    condition (entering the region's bounding box at all) is much easier.
+    Biasing the anchor toward the entry edge avoids this."""
+    x0, y0 = rx * REGION_SIZE, ry * REGION_SIZE
+    cx, cy = x0 + REGION_SIZE / 2, y0 + REGION_SIZE / 2
+    if from_dx == 1:   # entering from the west -> bias toward this region's west edge
+        cx = x0
+    elif from_dx == -1:
+        cx = x0 + REGION_SIZE - 1
+    if from_dy == 1:   # entering from the north -> bias toward this region's north edge
+        cy = y0
+    elif from_dy == -1:
+        cy = y0 + REGION_SIZE - 1
+    cells = region_cells(rx, ry)
+    return min(cells, key=lambda c: (c[0] - cx) ** 2 + (c[1] - cy) ** 2)
+
+
 ALL_REGIONS = [(rx, ry) for rx in range(N_REGIONS_PER_SIDE) for ry in range(N_REGIONS_PER_SIDE)
                if region_cells(rx, ry)]
 REGION_ANCHOR = {r: region_anchor(*r) for r in ALL_REGIONS}
@@ -96,18 +121,22 @@ def bfs_region_distance(r1, r2):
 
 
 @torch.no_grad()
-def hierarchical_plan_to_region(world_model, V_hi, start, target_region, k=2, max_macro_steps=MAX_L1_MACROSTEPS_PER_REGION_HOP, memory=3):
+def hierarchical_plan_to_region(world_model, V_hi, start, target_region, from_region=None, k=2, max_macro_steps=MAX_L1_MACROSTEPS_PER_REGION_HOP, memory=3):
     """Level-1 (K=2) planner, STOPPING EARLY as soon as the current region
     equals target_region (not when a specific cell is reached) - the
     region-hop only needs to cross the border, not reach the anchor
-    exactly. Uses the target region's anchor as the pseudo-goal for V_hi's
-    lookahead scoring (consistent with how V_hi was trained: it estimates
-    cost-to-a-specific-cell, and the anchor is the best available proxy for
-    'somewhere in that region'). Returns (path, success, actual_steps)."""
+    exactly. Uses an entry-direction-aware anchor as the pseudo-goal for
+    V_hi's lookahead scoring when from_region is given (see
+    region_entry_anchor's docstring for why), else falls back to the fixed
+    geometric-center anchor. Returns (path, success, actual_steps)."""
     x, y = start
     path = [(x, y)]
     recent = [(x, y)]
-    goal = REGION_ANCHOR[target_region]
+    if from_region is not None:
+        dx, dy = target_region[0] - from_region[0], target_region[1] - from_region[1]
+        goal = region_entry_anchor(target_region[0], target_region[1], dx, dy)
+    else:
+        goal = REGION_ANCHOR[target_region]
     g_repr = gh.tgt(world_model, *goal)
     if region_of(x, y) == target_region:
         return path, True, 0
@@ -145,7 +174,7 @@ def collect_region_transitions(world_model, V_hi, seed):
             start_cells = [cells[i] for i in rng.choice(len(cells), size=n_starts, replace=False)]
             for start in start_cells:
                 for _ in range(N_COLLECT_PER_STARTCELL):
-                    path, success, cost = hierarchical_plan_to_region(world_model, V_hi, start, nbr)
+                    path, success, cost = hierarchical_plan_to_region(world_model, V_hi, start, nbr, from_region=r)
                     arrival = path[-1]
                     dataset.append({
                         "start": start, "source_region": r, "target_region": nbr,
@@ -281,7 +310,7 @@ def plan_level3(world_model, V_hi, V3, region_repr, region_tgt_repr, start, goal
         for nbr in adjacent_regions(cur_region):
             # Estimate hop cost via a fresh real execution - this IS the actual plan step,
             # not a training sample, so grounding it for real here is the whole point.
-            sub_path, hop_success, hop_cost = hierarchical_plan_to_region(world_model, V_hi, (x, y), nbr)
+            sub_path, hop_success, hop_cost = hierarchical_plan_to_region(world_model, V_hi, (x, y), nbr, from_region=cur_region)
             v = V3(region_repr[nbr].unsqueeze(0), goal_r_repr.unsqueeze(0)).item()
             score = hop_cost + v
             stuck = not hop_success or nbr in recent_regions[-memory:]
