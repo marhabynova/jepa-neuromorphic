@@ -8,9 +8,28 @@ module cpu (
     // exactly the cycle of a qualifying store, so an off-chip consumer can
     // edge-detect it. Added so cpu has externally observable outputs (see
     // RESEARCH_NOTES.md §46 - without this, yosys `synth` sweeps the whole
-    // design away as unobserved dead logic).
+    // design away as unobserved dead logic). KEPT UNCHANGED (still fires on
+    // every MMIO-region store, same address 0xFF000000 the existing
+    // regression test checks) so tb_cpu.v's PASS condition stays valid.
     output reg [31:0] mmio_out,
-    output             mmio_valid
+    output             mmio_valid,
+
+    // Generic peripheral bus (added for SPI/Akida integration, SoC-level
+    // design): fires in PARALLEL with the single-register debug port above
+    // for ANY load/store whose address has top byte 0xFF - a peripheral
+    // instantiated outside cpu.v (see soc_top.v) decodes addr[7:0] itself to
+    // pick its own registers, so cpu.v stays a generic core that doesn't
+    // need to know what's attached. mmio_re is asserted for exactly the
+    // EXEC cycle of a LOAD targeting this region (same cycle the address is
+    // first presented) - a peripheral should register mmio_rdata off the
+    // CURRENT mmio_addr every clock edge unconditionally, the same
+    // synchronous-read convention dmem.v already uses, so it's ready by the
+    // time the CPU's extra MEM cycle consumes it.
+    output             mmio_we,
+    output             mmio_re,
+    output [31:0]      mmio_addr,
+    output [31:0]      mmio_wdata,
+    input  [31:0]      mmio_rdata
 );
     // §68/§74: imem/dmem reads became SYNCHRONOUS (1-cycle latency, the
     // timing real FPGA block RAM has) so yosys's memory_bram pass can infer
@@ -86,7 +105,8 @@ module cpu (
     // and everything decoded from it - doesn't update until the NEXT
     // FETCH->EXEC edge), causing a harmless-but-wrong duplicate dmem write
     // and a second mmio_valid pulse for the same logical store.
-    wire mmio_sel = mem_write && exec_now && (alu_result[31:24] == 8'hFF);
+    wire mmio_region = (alu_result[31:24] == 8'hFF);
+    wire mmio_sel = mem_write && exec_now && mmio_region;
     assign mmio_valid = mmio_sel;
 
     always @(posedge clk or posedge rst) begin
@@ -96,14 +116,31 @@ module cpu (
             mmio_out <= rd_data2;
     end
 
+    // Generic peripheral bus - same mmio_region gate as the debug port
+    // above, so a store to 0xFF000000 (the debug port's address) still also
+    // appears here; harmless, since no peripheral in soc_top.v decodes that
+    // specific offset. addr/wdata are just alu_result/rd_data2 passed
+    // through - cpu.v does no further decoding, that's the peripheral's job.
+    assign mmio_we    = mmio_sel;
+    assign mmio_re    = mem_to_reg && exec_now && mmio_region;
+    assign mmio_addr  = alu_result;
+    assign mmio_wdata = rd_data2;
+
     wire [31:0] dmem_rd;
     dmem dmem_u (
         .clk(clk), .addr(alu_result), .wr_data(rd_data2),
         .we(mem_write && exec_now && !mmio_sel), .rd_data(dmem_rd)
     );
 
+    // LOAD from an MMIO-region address reads mmio_rdata (the attached
+    // peripheral's registered output) instead of dmem_rd. mmio_region is
+    // driven by alu_result, which stays stable across EXEC->MEM exactly
+    // like dmem's address does, so this mux is safe to use combinationally
+    // here even though we're now in S_MEM.
+    wire [31:0] load_data = mmio_region ? mmio_rdata : dmem_rd;
+
     wire [31:0] pc_plus4 = pc + 32'd4;
-    assign wb_data = jump ? pc_plus4 : (mem_to_reg ? dmem_rd : alu_result);
+    assign wb_data = jump ? pc_plus4 : (mem_to_reg ? load_data : alu_result);
 
     // Dedicated branch comparator (separate from the ALU path) so BEQ/BNE/
     // BLT/BGE can all be expressed cleanly from funct3. BLTU/BGEU (unsigned)
