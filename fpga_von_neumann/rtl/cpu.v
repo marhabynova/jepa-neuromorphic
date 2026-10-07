@@ -202,7 +202,34 @@ module cpu (
     reg irq_pending;
     reg irq_enable;
     reg [31:0] epc;
-    wire irq_taken = irq_pending && irq_enable;
+    // BUG FIX (Opus audit A1, RESEARCH_NOTES.md §99): DI (irq_dis) and a
+    // pending interrupt both want to act on the SAME cycle whenever DI is
+    // the currently-executing instruction - DI isn't a load, so exec_now
+    // and returning_to_fetch are both true on DI's own EXEC cycle, exactly
+    // the condition that also makes irq_taken eligible. Without the
+    // exclusion below, the (unrelated) if-else priority in the update
+    // block further down would dispatch the pending interrupt INSTEAD of
+    // respecting DI - the one instruction whose entire purpose is to
+    // block exactly that. Excluding DI's own cycle here (not just in the
+    // update block) keeps every consumer of irq_taken - this wire, the
+    // pc_next mux below, and irq_dispatch - consistently blind to the
+    // interrupt for that one cycle; it stays pending (not cleared) for
+    // whenever EI re-enables it later.
+    wire irq_taken = irq_pending && irq_enable && !(exec_now && irq_dis);
+    // BUG FIX (Opus audit A2): IRET is ALSO returning_to_fetch on its own
+    // EXEC cycle (not a load), so if a handler calls EI before IRET and a
+    // new interrupt is already pending by the time IRET executes,
+    // irq_taken can be true on that exact cycle too. The pc_next mux
+    // below already prioritizes iret correctly (checked first in the
+    // ternary - PC goes to epc, not IRQ_VECTOR). But the SEPARATE update
+    // block further down must not independently treat this as "the
+    // interrupt was dispatched" - that would clear irq_pending (silently
+    // dropping the interrupt that never actually got its handler run) and
+    // clobber epc with pc_next_normal (a meaningless value - IRET's own
+    // "next instruction" address, not a real return point for anything).
+    // irq_dispatch excludes iret so bookkeeping only fires when the
+    // interrupt is genuinely the thing that happened this cycle.
+    wire irq_dispatch = returning_to_fetch && irq_taken && !iret;
 
     wire [31:0] pc_next = iret ? epc :
                           (returning_to_fetch && irq_taken) ? IRQ_VECTOR :
@@ -237,12 +264,17 @@ module cpu (
             // Latch any pulse, clear only once this specific interrupt is
             // actually taken (not just whenever irq happens to be low this
             // cycle - `irq` and the clear can coincide on the same edge).
-            if (irq && !(returning_to_fetch && irq_taken))
+            // Uses irq_dispatch (not the raw returning_to_fetch&&irq_taken)
+            // so an IRET coincident with a new pending interrupt (A2) does
+            // NOT clear it here - the interrupt never actually got
+            // dispatched this cycle (PC went to epc, not IRQ_VECTOR), so
+            // it must stay pending for whenever it's next checked.
+            if (irq && !irq_dispatch)
                 irq_pending <= 1'b1;
-            else if (returning_to_fetch && irq_taken)
+            else if (irq_dispatch)
                 irq_pending <= 1'b0;
 
-            if (returning_to_fetch && irq_taken) begin
+            if (irq_dispatch) begin
                 epc         <= pc_next_normal; // where normal execution would have gone
                 irq_enable  <= 1'b0;           // no nested interrupts without an explicit EI
             end else if (exec_now && irq_dis) begin
