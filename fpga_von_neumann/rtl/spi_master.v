@@ -98,6 +98,11 @@ module spi_master (
     reg       first_shift;
     reg [3:0] bits_left;
     reg       cs_n_reg;
+    // See the A5 fix below: CPHA=0's last sample lands on a LEADING edge,
+    // one half-period before sck would naturally return to cpol - this
+    // defers ending the transfer by exactly one more tick (the natural
+    // trailing edge) instead of forcing sck_reg out-of-band.
+    reg       finishing;
 
     wire next_sck = sck_reg ^ (tick && busy);
     wire leading_edge  = cpol ? (sck_reg == 1'b1 && !next_sck) : (sck_reg == 1'b0 && next_sck);
@@ -110,6 +115,7 @@ module spi_master (
         if (rst) begin
             busy <= 1'b0; div_cnt <= 16'd0; sck_reg <= 1'b0; cs_n_reg <= 1'b1;
             shift_reg <= 8'd0; bits_left <= 4'd0; rxdata_reg <= 8'd0; first_shift <= 1'b0;
+            finishing <= 1'b0;
         end else begin
             if (start_pulse) begin
                 busy        <= 1'b1;
@@ -158,6 +164,16 @@ module spi_master (
                 if (tick) begin
                     div_cnt <= 16'd0;
                     sck_reg <= ~sck_reg;
+                    // The deferred end-of-transfer from CPHA=0's last
+                    // sample (see below) - this tick's toggle IS the
+                    // natural trailing edge that returns sck to cpol, so
+                    // nothing needs to be forced; just let busy drop now
+                    // that the real edge has actually happened.
+                    if (finishing) begin
+                        busy      <= 1'b0;
+                        cs_n_reg  <= cs_force ? 1'b0 : 1'b1;
+                        finishing <= 1'b0;
+                    end
                 end else begin
                     div_cnt <= div_cnt + 16'd1;
                 end
@@ -183,25 +199,76 @@ module spi_master (
                 if (sample_edge) begin
                     rxdata_reg <= {rxdata_reg[6:0], spi_miso};
                     if (bits_left == 4'd1) begin
-                        busy      <= 1'b0;
-                        cs_n_reg  <= cs_force ? 1'b0 : 1'b1;
-                        bits_left <= 4'd0;
-                        // BUG FIX (Opus audit A5): for CPHA=0, the last
+                        // BUG FIX (Opus audit A5, caught by an
+                        // INDEPENDENT slave model, tb/spi_slave_model.v -
+                        // a self-consistent loopback test could not have
+                        // caught this, see below): for CPHA=0, the last
                         // sample lands on a LEADING edge - half a clock
                         // period before SCK would naturally return to
-                        // cpol on the following trailing edge. Since the
-                        // transfer ends right here (busy drops this same
-                        // cycle), that trailing edge never happens, and
-                        // the unconditional `sck_reg <= ~sck_reg` toggle
-                        // above (same always-block invocation, textually
-                        // earlier) leaves SCK parked at the WRONG level
-                        // (!cpol instead of cpol). This assignment is
-                        // textually later, so it wins (last nonblocking
-                        // write to the same reg in one block evaluation)
-                        // and forces the correct idle level. Harmless for
-                        // CPHA=1, which already lands on a trailing edge
-                        // (naturally back at cpol) - same value either way.
-                        sck_reg   <= cpol;
+                        // cpol on the following TRAILING edge. An
+                        // earlier draft of this fix ended the transfer
+                        // (busy<=0) on THIS same cycle and forced
+                        // `sck_reg <= cpol` directly, reasoning that
+                        // would at least park SCK at the right level.
+                        // That's wrong in a worse way: it OVERWROTE the
+                        // very toggle (`sck_reg <= ~sck_reg` above, same
+                        // always-block invocation) that makes this edge
+                        // the Nth sample in the first place - the
+                        // physical SCK pin never actually transitioned
+                        // for this bit at all. A self-consistent loopback
+                        // test (tb_spi.v) couldn't catch it, because the
+                        // master's own sample_edge/shift_edge wires are
+                        // computed from `next_sck` (a separate wire,
+                        // XOR-derived from tick&&busy), not from the
+                        // possibly-overridden sck_reg - so RXDATA still
+                        // came back correct from the master's own
+                        // internal perspective even though the physical
+                        // pin lied. tb/spi_slave_model.v watches the
+                        // actual pin and caught it directly: bit_cnt
+                        // stalled at 7, last_rx never latched.
+                        // Fix: don't touch sck_reg here at all - let
+                        // THIS tick's natural toggle (the real Nth
+                        // leading edge) happen untouched, and defer
+                        // ending the transfer to the FOLLOWING tick (see
+                        // the `if (finishing)` branch above), which is
+                        // the natural trailing edge that returns sck to
+                        // cpol on its own.
+                        //
+                        // SEPARATE BUG FOUND THE SAME WAY (not yet in the
+                        // Opus audit's A1-A8 list - found by this
+                        // independent-slave-model work itself, §99's own
+                        // point): the ORIGINAL code ended immediately for
+                        // CPHA=1 too (busy<=0; cs_n_reg<=... in this same
+                        // cycle as the final sample). That looked safe in
+                        // isolation (SCK does land back at cpol correctly
+                        // for CPHA=1), but cs_n_reg and sck_reg are BOTH
+                        // driven by nonblocking assignment from this SAME
+                        // always block/clock edge - meaning they update
+                        // atomically in the same simulation delta, with
+                        // ZERO hold time between the final sample edge
+                        // and CS deasserting. tb_spi.v's loopback test
+                        // couldn't catch this (the master's own RXDATA
+                        // capture never looks at the cs_n pin's value at
+                        // all), but tb/spi_slave_model.v's independent
+                        // sample logic gates on `!cs_n` at the moment of
+                        // the clock edge, and Verilog's nonblocking
+                        // update semantics mean it sees cs_n ALREADY
+                        // deasserted by the time it evaluates that same
+                        // edge - the 8th bit's sample was silently
+                        // skipped (bit_cnt stalled at 7, exactly as
+                        // observed in simulation). This is also a real
+                        // hardware concern, not just a simulation
+                        // artifact: a CS line with zero hold time past
+                        // the last clock edge is a genuine setup/hold
+                        // violation for any real external slave. Fix:
+                        // defer ending uniformly for BOTH cpha values via
+                        // the same `finishing` mechanism - CPHA=1 just
+                        // tolerates one extra (harmless, per the
+                        // shift_edge comment above) half-period of
+                        // clocking before CS actually drops, giving every
+                        // external slave real hold time on the last bit.
+                        finishing <= 1'b1;
+                        bits_left <= 4'd0;
                     end else begin
                         bits_left <= bits_left - 4'd1;
                     end
