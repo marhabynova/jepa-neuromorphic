@@ -10,18 +10,21 @@ module soc_top (
 );
     wire mmio_we, mmio_re;
     wire [31:0] mmio_addr, mmio_wdata, mmio_rdata;
+    wire spi_irq;
 
     cpu cpu_u (
         .clk(clk), .rst(rst),
         .mmio_out(debug_out), .mmio_valid(debug_valid),
         .mmio_we(mmio_we), .mmio_re(mmio_re),
-        .mmio_addr(mmio_addr), .mmio_wdata(mmio_wdata), .mmio_rdata(mmio_rdata)
+        .mmio_addr(mmio_addr), .mmio_wdata(mmio_wdata), .mmio_rdata(mmio_rdata),
+        .irq(spi_irq)
     );
 
     spi_master spi_u (
         .clk(clk), .rst(rst),
         .bus_we(mmio_we), .bus_re(mmio_re),
         .bus_addr(mmio_addr), .bus_wdata(mmio_wdata), .bus_rdata(mmio_rdata),
-        .spi_sck(spi_sck), .spi_mosi(spi_mosi), .spi_miso(spi_miso), .spi_cs_n(spi_cs_n)
+        .spi_sck(spi_sck), .spi_mosi(spi_mosi), .spi_miso(spi_miso), .spi_cs_n(spi_cs_n),
+        .irq_out(spi_irq)
     );
 endmodule

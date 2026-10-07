@@ -29,7 +29,16 @@ module cpu (
     output             mmio_re,
     output [31:0]      mmio_addr,
     output [31:0]      mmio_wdata,
-    input  [31:0]      mmio_rdata
+    input  [31:0]      mmio_rdata,
+
+    // §96: minimal interrupt mechanism (no CSRs - this core has none - so
+    // not spec-compliant RISC-V M-mode trap handling, just enough to let a
+    // peripheral wake the CPU without being polled). A peripheral should
+    // PULSE this for exactly one cycle per event (see spi_master.v's
+    // irq_out) - cpu.v latches it into an internal irq_pending flip-flop
+    // (below) so a short pulse is never missed even if it arrives mid-
+    // instruction, when the FSM isn't at a fetch boundary yet.
+    input              irq
 );
     // §68/§74: imem/dmem reads became SYNCHRONOUS (1-cycle latency, the
     // timing real FPGA block RAM has) so yosys's memory_bram pass can infer
@@ -52,12 +61,14 @@ module cpu (
     wire [6:0] funct7 = instr[31:25];
 
     wire reg_write, mem_write, mem_to_reg, alu_src, branch, jump, jalr, lui;
+    wire iret, irq_en, irq_dis;
     wire [3:0] alu_op;
 
     control ctrl (
         .opcode(opcode), .funct3(funct3), .funct7(funct7),
         .reg_write(reg_write), .mem_write(mem_write), .mem_to_reg(mem_to_reg),
         .alu_src(alu_src), .branch(branch), .jump(jump), .jalr(jalr), .lui(lui),
+        .iret(iret), .irq_en(irq_en), .irq_dis(irq_dis),
         .alu_op(alu_op)
     );
 
@@ -173,8 +184,29 @@ module cpu (
     // we're 4-byte aligned throughout anyway, this just matches spec).
     // JAL's target is still pc+imm (PC-relative, no ALU involvement).
     wire [31:0] jalr_target = {alu_result[31:1], 1'b0};
-    wire [31:0] pc_next = jalr ? jalr_target :
-                          (jump || branch_taken) ? (pc + imm) : pc_plus4;
+    wire [31:0] pc_next_normal = jalr ? jalr_target :
+                                (jump || branch_taken) ? (pc + imm) : pc_plus4;
+
+    // §96: minimal interrupt mechanism. irq_pending latches the (possibly
+    // single-cycle) `irq` input so it's never missed mid-instruction;
+    // irq_taken is checked only at a fetch boundary (returning_to_fetch),
+    // same discipline as every other pc_next decision here - interrupts
+    // never land mid-instruction. epc holds the address execution would
+    // have continued at, so IRET can resume exactly there. IRQ_VECTOR is a
+    // fixed address (word 1 / byte 4) - a program wanting to use
+    // interrupts must place its handler's first instruction there (e.g.
+    // via an unconditional JAL at address 0 that jumps over this slot to
+    // the real main program, the same convention real microcontrollers'
+    // reset/vector tables use).
+    localparam IRQ_VECTOR = 32'd4;
+    reg irq_pending;
+    reg irq_enable;
+    reg [31:0] epc;
+    wire irq_taken = irq_pending && irq_enable;
+
+    wire [31:0] pc_next = iret ? epc :
+                          (returning_to_fetch && irq_taken) ? IRQ_VECTOR :
+                          pc_next_normal;
 
     imem imem_u (.clk(clk), .addr(pc), .instr(instr));
 
@@ -193,6 +225,33 @@ module cpu (
                 pc <= pc_next;
             // else: hold pc - FETCH->EXEC and EXEC->MEM keep the address
             // stable for memory that's still catching up.
+        end
+    end
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            irq_pending <= 1'b0;
+            irq_enable  <= 1'b0;
+            epc         <= 32'd0;
+        end else begin
+            // Latch any pulse, clear only once this specific interrupt is
+            // actually taken (not just whenever irq happens to be low this
+            // cycle - `irq` and the clear can coincide on the same edge).
+            if (irq && !(returning_to_fetch && irq_taken))
+                irq_pending <= 1'b1;
+            else if (returning_to_fetch && irq_taken)
+                irq_pending <= 1'b0;
+
+            if (returning_to_fetch && irq_taken) begin
+                epc         <= pc_next_normal; // where normal execution would have gone
+                irq_enable  <= 1'b0;           // no nested interrupts without an explicit EI
+            end else if (exec_now && irq_dis) begin
+                irq_enable <= 1'b0;
+            end else if (exec_now && (irq_en || iret)) begin
+                // IRET re-enables interrupts as part of returning - standard
+                // convention in most real architectures' return-from-trap.
+                irq_enable <= 1'b1;
+            end
         end
     end
 endmodule

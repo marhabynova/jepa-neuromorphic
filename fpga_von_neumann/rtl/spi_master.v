@@ -16,7 +16,13 @@ module spi_master (
     output        spi_sck,
     output        spi_mosi,
     input         spi_miso,
-    output        spi_cs_n
+    output        spi_cs_n,
+
+    // §96: pulses for exactly one cycle when a transfer finishes (busy
+    // 1->0) - lets the CPU wait for "Akida done" via an interrupt instead
+    // of busy-polling STATUS, the whole point of adding interrupts to
+    // cpu.v in the first place.
+    output        irq_out
 );
     // Register map (word addresses, byte offsets within the 0xFF-prefixed
     // MMIO page - 0x00/0x?? reserved for cpu.v's own single-register debug
@@ -197,4 +203,15 @@ module spi_master (
     assign spi_sck  = sck_reg;
     assign spi_mosi = shift_reg[7];
     assign spi_cs_n = cs_n_reg;
+
+    // One-cycle-delayed pulse (fires the cycle right after busy actually
+    // drops to 0, avoiding any same-cycle ambiguity with the condition
+    // that clears busy) - matches cpu.v's expectation of a short pulse per
+    // completed transfer, which it latches internally so it's never missed.
+    reg irq_pulse;
+    always @(posedge clk or posedge rst) begin
+        if (rst) irq_pulse <= 1'b0;
+        else     irq_pulse <= (busy && sample_edge && bits_left == 4'd1);
+    end
+    assign irq_out = irq_pulse;
 endmodule

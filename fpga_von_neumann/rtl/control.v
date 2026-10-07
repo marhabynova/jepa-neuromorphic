@@ -10,6 +10,9 @@ module control (
     output       jump,
     output       jalr,
     output       lui,
+    output       iret,
+    output       irq_en,
+    output       irq_dis,
     output [3:0] alu_op
 );
     localparam OP_RTYPE  = 7'b0110011;
@@ -20,8 +23,15 @@ module control (
     localparam OP_JAL    = 7'b1101111;
     localparam OP_JALR   = 7'b1100111;
     localparam OP_LUI    = 7'b0110111;
+    // §96: interrupt control instructions, under opcode 0001011 - this is
+    // "custom-0" in the RISC-V spec, explicitly reserved for exactly this
+    // kind of non-standard extension, not a real/colliding RV32I opcode.
+    // No CSRs exist in this core (mstatus/mepc/mtvec would be the standard
+    // RISC-V way), so this is a deliberately minimal custom mechanism, not
+    // spec-compliant M-mode trap handling.
+    localparam OP_CUSTOM0 = 7'b0001011;
 
-    reg rw, mw, m2r, asrc, br, jp, jr, lu;
+    reg rw, mw, m2r, asrc, br, jp, jr, lu, ir, ien, idis;
     reg [3:0] aop;
 
     assign reg_write  = rw;
@@ -32,6 +42,9 @@ module control (
     assign jump       = jp;
     assign jalr       = jr;
     assign lui        = lu;
+    assign iret       = ir;
+    assign irq_en     = ien;
+    assign irq_dis    = idis;
     assign alu_op     = aop;
 
     // v2 scope: ADD/SUB/AND/OR/XOR/SLT/SLL/SRL (R-type), ADDI/ANDI/ORI (I-type),
@@ -39,10 +52,12 @@ module control (
     // JAL. v3 adds JALR (real function-call/return convention - without it,
     // no subroutine could return to a dynamic caller, only to a fixed
     // offset) and LUI (build a 32-bit constant in 2 instructions instead of
-    // the addi+sll shift trick asm.py used everywhere before this).
+    // the addi+sll shift trick asm.py used everywhere before this). §96
+    // adds IRET/EI/DI for a minimal interrupt mechanism (see cpu.v).
     // SRA, BLTU/BGEU, MUL/DIV, AUIPC, and the rest of RV32I are still TODO.
     always @(*) begin
-        rw = 0; mw = 0; m2r = 0; asrc = 0; br = 0; jp = 0; jr = 0; lu = 0; aop = 4'b0000;
+        rw = 0; mw = 0; m2r = 0; asrc = 0; br = 0; jp = 0; jr = 0; lu = 0;
+        ir = 0; ien = 0; idis = 0; aop = 4'b0000;
 
         case (opcode)
             OP_RTYPE: begin
@@ -94,6 +109,17 @@ module control (
                 // rd <= imm_u (top 20 bits, bottom 12 zero) - no ALU
                 // involvement needed, cpu.v routes this straight through.
                 rw = 1; lu = 1;
+            end
+            OP_CUSTOM0: begin
+                // funct3 selects which of the 3 interrupt-control ops this
+                // is; none of them write a general-purpose register
+                // (rw stays 0 - rd is don't-care/ignored in the encoding).
+                case (funct3)
+                    3'b000: ir   = 1; // IRET: pc<=epc, irq_enable<=1 (cpu.v)
+                    3'b001: ien  = 1; // EI:   irq_enable<=1
+                    3'b010: idis = 1; // DI:   irq_enable<=0
+                    default: ;
+                endcase
             end
             default: begin
                 // unimplemented opcode: all control signals stay at safe defaults (no writes)
