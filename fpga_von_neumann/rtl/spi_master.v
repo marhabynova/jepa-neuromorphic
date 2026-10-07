@@ -128,7 +128,21 @@ module spi_master (
                 // the following trailing edge - that's what first_shift
                 // guards below.
                 shift_reg <= txdata_reg;
-                sck_reg   <= cpol;
+                // BUG FIX (Opus audit A4, caught before simulation by
+                // re-reading this against the CTRL write-handler above):
+                // `cpol` is a REGISTER updated by the OTHER always block
+                // in this SAME clock edge (sel_ctrl's bus_we branch) - if
+                // software writes mode bits and START together in one
+                // CTRL write (which the register map invites, since
+                // bit0=START and bits3:2=MODE share a register), this
+                // line would read the STALE pre-write cpol, parking sck
+                // at the wrong idle level for the mode actually being
+                // requested. Fix: read bus_wdata[2] directly, matching
+                // what cpol is about to become - consistent since the
+                // write handler latches that same bit into cpol this
+                // same cycle (same pattern as i2c_master.v's txdata_reg
+                // stale-read fix).
+                sck_reg   <= bus_wdata[2];
             end else if (busy) begin
                 // BUG FIXED: an earlier draft had an unconditional
                 // `sck_reg <= cpol` default sitting OUTSIDE this if/else,
@@ -172,6 +186,22 @@ module spi_master (
                         busy      <= 1'b0;
                         cs_n_reg  <= cs_force ? 1'b0 : 1'b1;
                         bits_left <= 4'd0;
+                        // BUG FIX (Opus audit A5): for CPHA=0, the last
+                        // sample lands on a LEADING edge - half a clock
+                        // period before SCK would naturally return to
+                        // cpol on the following trailing edge. Since the
+                        // transfer ends right here (busy drops this same
+                        // cycle), that trailing edge never happens, and
+                        // the unconditional `sck_reg <= ~sck_reg` toggle
+                        // above (same always-block invocation, textually
+                        // earlier) leaves SCK parked at the WRONG level
+                        // (!cpol instead of cpol). This assignment is
+                        // textually later, so it wins (last nonblocking
+                        // write to the same reg in one block evaluation)
+                        // and forces the correct idle level. Harmless for
+                        // CPHA=1, which already lands on a trailing edge
+                        // (naturally back at cpol) - same value either way.
+                        sck_reg   <= cpol;
                     end else begin
                         bits_left <= bits_left - 4'd1;
                     end
