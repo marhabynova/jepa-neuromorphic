@@ -48,6 +48,8 @@ PCF       :=
 CPU_TESTS := \
 	tb_cpu:asm.py:program.hex \
 	tb_jalr_lui:asm_jalr_lui_test.py:program_jalr_lui.hex \
+	tb_rv32i_ext:asm_rv32i_ext_test.py:program_rv32i_ext.hex \
+	tb_illegal_instr:asm_rv32i_ext_test.py:program_rv32i_ext.hex \
 	tb_soc_spi:asm_spi_test.py:program_spi.hex \
 	tb_soc_irq:asm_irq_test.py:program_irq.hex \
 	tb_soc_multi_periph:asm_multi_periph_test.py:program_multi_periph.hex \

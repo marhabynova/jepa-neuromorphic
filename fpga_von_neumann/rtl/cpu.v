@@ -61,6 +61,7 @@ module cpu (
     wire [6:0] funct7 = instr[31:25];
 
     wire reg_write, mem_write, mem_to_reg, alu_src, branch, jump, jalr, lui;
+    wire auipc, illegal;
     wire iret, irq_en, irq_dis;
     wire [3:0] alu_op;
 
@@ -68,8 +69,9 @@ module cpu (
         .opcode(opcode), .funct3(funct3), .funct7(funct7),
         .reg_write(reg_write), .mem_write(mem_write), .mem_to_reg(mem_to_reg),
         .alu_src(alu_src), .branch(branch), .jump(jump), .jalr(jalr), .lui(lui),
+        .auipc(auipc),
         .iret(iret), .irq_en(irq_en), .irq_dis(irq_dis),
-        .alu_op(alu_op)
+        .alu_op(alu_op), .illegal(illegal)
     );
 
     // Immediate generation for all formats we use (I/S/B/J/U), sign-extended
@@ -87,6 +89,7 @@ module cpu (
             7'b0100011: imm = imm_s; // STORE
             7'b1100011: imm = imm_b; // BRANCH
             7'b1101111: imm = imm_j; // JAL
+            7'b0010111: imm = imm_u; // AUIPC (§100) - rd <= pc + imm_u
             default:    imm = imm_i; // ITYPE / LOAD
         endcase
     end
@@ -112,8 +115,14 @@ module cpu (
     );
 
     wire [31:0] alu_b = alu_src ? imm : rd_data2;
+    // §100: AUIPC is the one instruction whose left operand is the PC
+    // rather than a register. Feeding it in here (one 32-bit mux) reuses
+    // the ALU's existing adder instead of adding a second 32-bit adder,
+    // and AUIPC's result then travels the ordinary alu_result writeback
+    // path with no change to the wb_data mux.
+    wire [31:0] alu_a = auipc ? pc : rd_data1;
     wire [31:0] alu_result;
-    alu alu_u (.a(rd_data1), .b(alu_b), .op(alu_op), .result(alu_result));
+    alu alu_u (.a(alu_a), .b(alu_b), .op(alu_op), .result(alu_result));
 
     // Gated by exec_now (§74 fix): without it, mem_write/mmio_sel would
     // stay combinationally true for one extra S_FETCH cycle too (instr -
@@ -160,12 +169,19 @@ module cpu (
     // directly, no ALU involvement.
     assign wb_data = jump ? pc_plus4 : (lui ? imm_u : (mem_to_reg ? load_data : alu_result));
 
-    // Dedicated branch comparator (separate from the ALU path) so BEQ/BNE/
-    // BLT/BGE can all be expressed cleanly from funct3. BLTU/BGEU (unsigned)
-    // are not implemented yet - TODO before this instruction set is called
-    // "complete".
-    wire branch_eq = (rd_data1 == rd_data2);
-    wire branch_lt = ($signed(rd_data1) < $signed(rd_data2));
+    // Dedicated branch comparator (separate from the ALU path) so all six
+    // conditional branches can be expressed cleanly from funct3.
+    // §100: BLTU/BGEU used to be missing - funct3 110/111 hit the
+    // `default: branch_cond = 0` arm, so those branches were NEVER taken,
+    // no matter what the operands were. (control.v also kept br=1 for
+    // them, so they weren't flagged either - they just fell through
+    // silently, which is exactly how an unsigned loop bound turns into an
+    // off-by-everything bug.) `branch_ltu` is a genuinely different
+    // comparison from `branch_lt`: for 0xFFFFFFFF vs 0x00000001 the
+    // signed compare says less-than, the unsigned one says greater-than.
+    wire branch_eq  = (rd_data1 == rd_data2);
+    wire branch_lt  = ($signed(rd_data1) < $signed(rd_data2));
+    wire branch_ltu = (rd_data1 < rd_data2);
     reg  branch_cond;
     always @(*) begin
         case (funct3)
@@ -173,7 +189,9 @@ module cpu (
             3'b001:  branch_cond = !branch_eq;   // BNE
             3'b100:  branch_cond = branch_lt;    // BLT
             3'b101:  branch_cond = !branch_lt;   // BGE
-            default: branch_cond = 1'b0;
+            3'b110:  branch_cond = branch_ltu;   // BLTU
+            3'b111:  branch_cond = !branch_ltu;  // BGEU
+            default: branch_cond = 1'b0;         // 010/011 unassigned (control.v flags them illegal)
         endcase
     end
     wire branch_taken = branch && branch_cond;
@@ -252,6 +270,29 @@ module cpu (
                 pc <= pc_next;
             // else: hold pc - FETCH->EXEC and EXEC->MEM keep the address
             // stable for memory that's still catching up.
+        end
+    end
+
+    // §100: observability for control.v's `illegal`. An unimplemented
+    // encoding now retires as an architectural NOP (reg_write/mem_write
+    // are both forced low in control.v) instead of executing as some
+    // other instruction - but "did nothing" and "did the right thing"
+    // look identical from the outside, so this sticky flag plus the PC
+    // of the FIRST offender lets a testbench prove the instruction was
+    // rejected rather than mis-executed. No output port and no soc_top
+    // wiring: a real board has no pin to spare for it (§99c's pin-budget
+    // lesson) and yosys sweeps both registers away during synthesis, so
+    // this costs zero LCs. It is deliberately NOT a trap - this core has
+    // no CSRs and no trap infrastructure (see control.v's §96 note).
+    reg illegal_seen;
+    reg [31:0] illegal_pc;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            illegal_seen <= 1'b0;
+            illegal_pc   <= 32'd0;
+        end else if (exec_now && illegal && !illegal_seen) begin
+            illegal_seen <= 1'b1;
+            illegal_pc   <= pc;
         end
     end
 

@@ -6,3 +6,6 @@ build/
 # (tools/asm_*.py were invoked from inside tools/). `make test` now writes
 # them to build/hex/ instead; these are leftovers.
 tools/*.hex
+
+# yosys/abc scratch file dropped in the working directory
+abc.history
