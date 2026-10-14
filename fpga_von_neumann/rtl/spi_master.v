@@ -104,6 +104,28 @@ module spi_master (
     // trailing edge) instead of forcing sck_reg out-of-band.
     reg       finishing;
 
+    // §100: spi_miso is driven by an external device off ITS own clock
+    // domain (and, on the planned board, through a TXB0108 level
+    // translator), so it can change arbitrarily close to a clock edge
+    // here. Sampling it straight into rxdata_reg could latch a
+    // metastable value. Two flops in series give the first a full clock
+    // period to resolve. The 2-cycle delay is harmless because the
+    // slave presents each bit a half SCK period (clkdiv+1 clocks) ahead
+    // of the sampling edge - at the default clkdiv this is many clocks
+    // of margin, and even the fastest setting used in simulation
+    // (clkdiv=2, 3 clocks per half period) still samples the bit the
+    // slave drove on the previous edge.
+    reg miso_meta, miso_sync;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            miso_meta <= 1'b0;
+            miso_sync <= 1'b0;
+        end else begin
+            miso_meta <= spi_miso;
+            miso_sync <= miso_meta;
+        end
+    end
+
     wire next_sck = sck_reg ^ (tick && busy);
     wire leading_edge  = cpol ? (sck_reg == 1'b1 && !next_sck) : (sck_reg == 1'b0 && next_sck);
     wire trailing_edge = cpol ? (sck_reg == 1'b0 && next_sck) : (sck_reg == 1'b1 && !next_sck);
@@ -197,7 +219,7 @@ module spi_master (
                 // doesn't matter since nothing reads shift_reg once busy
                 // drops.
                 if (sample_edge) begin
-                    rxdata_reg <= {rxdata_reg[6:0], spi_miso};
+                    rxdata_reg <= {rxdata_reg[6:0], miso_sync};
                     if (bits_left == 4'd1) begin
                         // BUG FIX (Opus audit A5, caught by an
                         // INDEPENDENT slave model, tb/spi_slave_model.v -

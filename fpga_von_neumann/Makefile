@@ -67,7 +67,8 @@ PERIPH_TESTS := \
 	tb_spi_a4_a5 \
 	tb_spi_slave_model \
 	tb_i2c \
-	tb_i2c_open_drain
+	tb_i2c_open_drain \
+	tb_sync_inputs
 
 # Trace-only benches kept from debugging sessions: they print per-edge
 # traces and have no PASS/FAIL verdict of their own. They are still

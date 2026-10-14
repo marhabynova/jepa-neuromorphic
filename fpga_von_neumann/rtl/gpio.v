@@ -30,9 +30,31 @@ module gpio (
     end
     assign gpio_out = out_reg;
 
+    // §100: gpio_in comes from a pin driven by something with no
+    // relationship to this clock, so it can change arbitrarily close to
+    // a clock edge. Capturing it in one flip-flop (what `rd_data <=
+    // {24'd0, gpio_in}` did) means that flop can go metastable, and
+    // because rd_data fans out to the whole 32-bit bus-read path, a
+    // single metastable bit could be resolved DIFFERENTLY by different
+    // downstream gates in the same cycle - not just a wrong bit, an
+    // internally inconsistent word. Two flops in series give the first
+    // one a full clock period to settle before anything else sees it.
+    // Cost: 16 flip-flops and 2 clock cycles of latency on an input
+    // that software polls anyway.
+    reg [7:0] gpio_in_meta, gpio_in_sync;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            gpio_in_meta <= 8'd0;
+            gpio_in_sync <= 8'd0;
+        end else begin
+            gpio_in_meta <= gpio_in;
+            gpio_in_sync <= gpio_in_meta;
+        end
+    end
+
     reg [31:0] rd_data;
     always @(posedge clk) begin
-        if (sel_in) rd_data <= {24'd0, gpio_in};
+        if (sel_in) rd_data <= {24'd0, gpio_in_sync};
         else        rd_data <= 32'd0;
     end
     assign bus_rdata = rd_data;

@@ -40,8 +40,15 @@ module synth_top (
     wire scl_o, scl_oe, scl_i;
     wire sda_o, sda_oe, sda_i;
 
+    // §100: the reset PIN is asynchronous to clk. Driving every
+    // flip-flop's async reset from it directly (what this used to do)
+    // means the design LEAVES reset on different clock edges in
+    // different corners of the die. See reset_sync.v.
+    wire rst_sync;
+    reset_sync rst_sync_u (.clk(clk), .rst_in(rst), .rst_out(rst_sync));
+
     soc_top soc_u (
-        .clk(clk), .rst(rst),
+        .clk(clk), .rst(rst_sync),
         .spi_sck(spi_sck), .spi_mosi(spi_mosi), .spi_miso(spi_miso), .spi_cs_n(spi_cs_n),
         .debug_out(unused_debug_out), .debug_valid(unused_debug_valid),
         .gpio_out(gpio_out), .gpio_in(gpio_in),

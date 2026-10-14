@@ -119,6 +119,37 @@ module i2c_master (
 
     wire tick = (div_cnt == clkdiv);
 
+    // §100: SDA and SCL are driven by other devices on a shared bus,
+    // entirely asynchronously to this clock (and, on the planned board,
+    // through a TXB0108 level translator), so both inputs can change
+    // arbitrarily close to a clock edge. Sampling them directly - which
+    // is what the ACK check, the read-data shift and the clock-stretch
+    // check all did - risks latching a metastable value. Two flops in
+    // series give the first a full clock period to resolve.
+    //
+    // The 2-cycle delay is fine for both uses:
+    //   - data: the slave presents each bit on the preceding SCL
+    //     falling edge, a full half-period (clkdiv+1 clocks, 60 at the
+    //     reset default) before the master samples, so a 2-clock lag
+    //     stays well inside the valid window.
+    //   - clock stretch: the lag just makes the master wait 2 extra
+    //     clocks before believing SCL has gone high, which lengthens
+    //     the SCL high phase slightly - i.e. the bus runs a hair SLOWER
+    //     than nominal, the safe direction for a maximum-rate spec.
+    reg scl_meta, scl_sync, sda_meta, sda_sync;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            // Reset to the idle (released, pulled-up) level, not 0 -
+            // coming out of reset believing the bus is held low would
+            // make the master think a slave is stretching the clock.
+            scl_meta <= 1'b1; scl_sync <= 1'b1;
+            sda_meta <= 1'b1; sda_sync <= 1'b1;
+        end else begin
+            scl_meta <= scl_i;  scl_sync <= scl_meta;
+            sda_meta <= sda_i;  sda_sync <= sda_meta;
+        end
+    end
+
     // §100: clock stretching. `scl_reg` is now only an INTENT ("release
     // the line" vs "pull it low"); what the bus actually does is scl_i.
     // If this master has released SCL (scl_reg=1) but the line still
@@ -128,7 +159,7 @@ module i2c_master (
     // div_cnt, so the half-period restarts cleanly once the line is
     // free) is exactly the required response. Qualified by `busy` so an
     // idle master is never frozen and can still latch a START request.
-    wire stretch_hold = busy && scl_reg && !scl_i;
+    wire stretch_hold = busy && scl_reg && !scl_sync;
 
     always @(posedge clk or posedge rst) begin
         if (rst) begin
@@ -242,7 +273,7 @@ module i2c_master (
                         scl_reg <= 1'b0;
                         if (bit_idx == 4'd8) begin
                             // ACK/NACK slot just finished.
-                            if (!is_read) ack_error <= sda_i; // slave NACKed a write = sda stayed high
+                            if (!is_read) ack_error <= sda_sync; // slave NACKed a write = sda stayed high
                             if (stop_after) begin
                                 sda_reg <= 1'b0; sda_oe_reg <= 1'b1; // prep for STOP (SDA must be low while SCL low, then rise while SCL high)
                                 state <= S_STOP_LOW;
@@ -287,7 +318,7 @@ module i2c_master (
                         // Sample incoming data WHILE scl_reg was still 1 (the
                         // just-finished S_BIT_HIGH), for read bits 0-7 only.
                         if (is_read && bit_idx != 4'd8) begin
-                            rxdata_reg <= {rxdata_reg[6:0], sda_i};
+                            rxdata_reg <= {rxdata_reg[6:0], sda_sync};
                         end
                     end
                 end
