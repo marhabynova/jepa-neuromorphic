@@ -44,7 +44,11 @@ module i2c_master (
 );
     // Register map:
     //   0xFF000040  CTRL   (W) bit0=START(pulse) bit1=STOP_AFTER bit2=IS_READ bit3=NACK_AFTER(read only)
-    //   0xFF000044  CLKDIV (W) [15:0] quarter-bit-period divider
+    //   0xFF000044  CLKDIV (W) [15:0] HALF-bit-period divider: each of a
+    //                               bit's two SCL phases lasts clkdiv+1 clocks,
+    //                               so f_SCL = f_clk / (2*(clkdiv+1)). (The old
+    //                               comment said "quarter"; the FSM has only two
+    //                               phases per bit, so that was never right.)
     //   0xFF000048  TXDATA (W) [7:0]  byte to send (address+R/W for the first byte of a transaction, data after)
     //   0xFF00004C  STATUS (R) bit0=BUSY bit1=ACK_ERROR (no slave ACKed - e.g. nothing at that address)
     //   0xFF000050  RXDATA (R) [7:0]  byte received (for IS_READ bytes)
