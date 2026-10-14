@@ -1,0 +1,8 @@
+# Everything `make` produces: per-test program images, iverilog binaries
+# and logs, yosys/nextpnr/icepack output. All regenerable from source.
+build/
+
+# Program images written straight into tools/ by an older hand-run flow
+# (tools/asm_*.py were invoked from inside tools/). `make test` now writes
+# them to build/hex/ instead; these are leftovers.
+tools/*.hex

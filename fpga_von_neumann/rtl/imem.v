@@ -21,8 +21,24 @@ module imem (
     // accounts for this 1-cycle latency.
     reg [31:0] mem [0:1023];
 
+    // The program image used to be hard-coded as "program.hex" in the
+    // current working directory, which meant EVERY cpu-level testbench
+    // shared one mutable file: running tb_soc_spi after tb_cpu silently
+    // ran the wrong program unless the matching tools/asm_*.py had been
+    // re-run first. (The audit confirmed tb_cpu/tb_soc_spi/tb_soc_irq/
+    // tb_jalr_lui/tb_irq_edge_cases all fail against a checked-in
+    // program.hex that belongs to a different test.) IMEM_HEX lets the
+    // Makefile hand each testbench its OWN immutable hex file
+    // (-DIMEM_HEX=\"build/hex/program_spi.hex\"), so test order can never
+    // change a result. The default keeps the old behaviour for anyone
+    // invoking iverilog by hand, and yosys takes the same default (the
+    // initial block is a simulation/BRAM-init construct either way).
+`ifndef IMEM_HEX
+  `define IMEM_HEX "program.hex"
+`endif
+
     initial begin
-        $readmemh("program.hex", mem);
+        $readmemh(`IMEM_HEX, mem);
     end
 
     always @(posedge clk)
