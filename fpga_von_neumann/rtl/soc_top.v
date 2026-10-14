@@ -17,7 +17,14 @@ module soc_top (
     // PI4IOE5V6408 GPIO expander (addr 0x43) must be driven over I2C to
     // wake Akida before SPI can talk to it at all. Disjoint address range
     // (0x40-0x50) from SPI (0x10-0x20) and GPIO (0x30-0x34).
-    output        i2c_scl,
+    // §100: SCL joined SDA as a true open-drain (o, oe, i) triple - it
+    // used to be a plain push-pull output, which is not legal I2C and
+    // made clock stretching impossible to even detect. soc_top still
+    // just passes the triples through; synth_top.v is where they become
+    // real bidirectional pads.
+    output        i2c_scl_o,
+    output        i2c_scl_oe,
+    input         i2c_scl_i,
     output        i2c_sda_o,
     output        i2c_sda_oe,
     input         i2c_sda_i
@@ -60,6 +67,7 @@ module soc_top (
         .clk(clk), .rst(rst),
         .bus_we(mmio_we), .bus_re(mmio_re),
         .bus_addr(mmio_addr), .bus_wdata(mmio_wdata), .bus_rdata(i2c_rdata),
-        .scl(i2c_scl), .sda_o(i2c_sda_o), .sda_oe(i2c_sda_oe), .sda_i(i2c_sda_i)
+        .scl_o(i2c_scl_o), .scl_oe(i2c_scl_oe), .scl_i(i2c_scl_i),
+        .sda_o(i2c_sda_o), .sda_oe(i2c_sda_oe), .sda_i(i2c_sda_i)
     );
 endmodule

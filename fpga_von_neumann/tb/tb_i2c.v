@@ -9,7 +9,11 @@ module tb_i2c;
     reg bus_we;
     reg [31:0] bus_addr, bus_wdata;
     wire [31:0] bus_rdata;
-    wire scl;
+    // §100: SCL is open-drain now too, so the bench must model the bus
+    // the way a real board does - a pull-up that anything may pull low -
+    // instead of taking a push-pull output straight from the master.
+    wire m_scl_o, m_scl_oe;
+    wire scl = !(m_scl_oe && !m_scl_o);
     wire m_sda_o, m_sda_oe;
     wire s_sda_o, s_sda_oe;
     reg [7:0] slave_tx_byte;
@@ -23,7 +27,7 @@ module tb_i2c;
     i2c_master dut (
         .clk(clk), .rst(rst),
         .bus_we(bus_we), .bus_re(1'b0), .bus_addr(bus_addr), .bus_wdata(bus_wdata), .bus_rdata(bus_rdata),
-        .scl(scl), .sda_o(m_sda_o), .sda_oe(m_sda_oe), .sda_i(sda)
+        .scl_o(m_scl_o), .scl_oe(m_scl_oe), .scl_i(scl), .sda_o(m_sda_o), .sda_oe(m_sda_oe), .sda_i(sda)
     );
 
     i2c_slave_model #(.MY_ADDR(7'h43)) slave (

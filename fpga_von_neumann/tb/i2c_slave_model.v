@@ -107,10 +107,24 @@ module i2c_slave_model #(
                 if (bit_cnt == 3'd7) st <= ST_DATA_ACK;
             end
             ST_DATA_ACK: begin
-                // For a read, this clock also samples the MASTER's ack/nack
-                // (not acted on by this simple model - a real slave would
-                // stop sending more bytes on a master NACK; this model
-                // only ever sends one byte per address phase anyway).
+                // This clock samples the MASTER's ack/nack bit. For a
+                // READ, the spec is explicit: a NACK from the master
+                // means "stop sending", and the slave must RELEASE SDA
+                // so the master can then issue a STOP (which needs SDA
+                // to be free to rise while SCL is high).
+                //
+                // The model used to ignore the NACK, on the reasoning
+                // that it only ever sends one byte anyway. That was
+                // wrong, and tb_i2c_open_drain.v found it: after a read
+                // of 0x00 the model kept pulling SDA low forever, so the
+                // master's STOP never appeared on the bus, the next
+                // START was invisible, and the FOLLOWING write
+                // transaction silently decoded as a continuation of the
+                // old read. (tb_i2c.v never saw it because its read is
+                // the last thing it does.) Clearing `addressed` stops
+                // this slave driving anything until it is addressed
+                // again, which is exactly what a real one does.
+                if (is_read && sda_i) addressed <= 1'b0;
                 st <= ST_DATA; bit_cnt <= 0;
             end
         endcase

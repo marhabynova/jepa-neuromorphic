@@ -12,15 +12,32 @@ module i2c_master (
     // cannot be woken from sleep with SPI alone - its PI4IOE5V6408 GPIO
     // expander (address 0x43) must be driven over I2C first (AKD_SLEEP/
     // AKD_RST pins). This is the hard prerequisite the hardware plan was
-    // missing. Open-drain SDA modeled the standard way for synthesizable
-    // Verilog: sda_oe=1 actively drives sda_o, sda_oe=0 releases the line
-    // for the external pull-up (or the slave) to control; sda_i is the
-    // actual line state, always sampled regardless of who's driving.
-    // No clock-stretching support (a slave holding SCL low to stall the
-    // master) - not needed for the simple register read/writes the
-    // BB15 bring-up sequence does, but a real limitation if a future
-    // slave needs it.
-    output        scl,
+    // missing.
+    //
+    // TRUE OPEN-DRAIN (§100 - the previous version was not). I2C has no
+    // push-pull drivers at all: a device may only pull a line LOW or
+    // release it, and the bus's external pull-up resistor provides every
+    // high level. The earlier code set sda_oe=1 together with sda_reg=1
+    // in six places, and drove SCL push-pull outright - on a real bus
+    // that means the master actively fights any slave that is ACKing or
+    // clock-stretching, i.e. a driver sourcing current shorted against
+    // one sinking it. It only looked fine because the testbench's
+    // wired-AND model resolved it in the master's favour.
+    //
+    // Both lines are now (o, oe, i) triples where `o` is hard-wired to 0
+    // and `oe` is asserted ONLY to pull low:
+    //     oe=1 -> pull low        oe=0 -> release (pull-up/slave wins)
+    // so it is structurally impossible for this module to source a high.
+    // synth_top.v turns each triple into one real bidirectional pad.
+    //
+    // scl_i additionally enables CLOCK STRETCHING: whenever this master
+    // has released SCL but the line still reads low, a slave is holding
+    // it, and the whole transfer FSM freezes until the slave lets go
+    // (see `stretch_hold` below). The old version had no way to even
+    // observe this - SCL was output-only.
+    output        scl_o,
+    output        scl_oe,
+    input         scl_i,
     output        sda_o,
     output        sda_oe,
     input         sda_i
@@ -76,7 +93,16 @@ module i2c_master (
 
     always @(posedge clk or posedge rst) begin
         if (rst) begin
-            clkdiv <= 16'd10;
+            // §100: the reset default used to be 10, which at this SoC's
+            // 12 MHz clock is 12e6 / (2 * (10+1)) = 545 kHz - more than
+            // five times the 100 kHz the BrainBoard 1500's I2C bus is
+            // specified for, so a board brought up without software
+            // writing CLKDIV first would simply not communicate.
+            // 59 gives 12e6 / (2 * (59+1)) = 100.0 kHz nominal; with the
+            // clock-stretch check costing a couple of clocks per SCL-high
+            // phase the real figure lands just UNDER 100 kHz, which is
+            // the correct side of a maximum.
+            clkdiv <= 16'd59;
         end else if (bus_we) begin
             if (sel_clkdiv)      clkdiv     <= bus_wdata[15:0];
             else if (sel_txdata) txdata_reg <= bus_wdata[7:0];
@@ -93,12 +119,23 @@ module i2c_master (
 
     wire tick = (div_cnt == clkdiv);
 
+    // §100: clock stretching. `scl_reg` is now only an INTENT ("release
+    // the line" vs "pull it low"); what the bus actually does is scl_i.
+    // If this master has released SCL (scl_reg=1) but the line still
+    // reads low while a transfer is in progress, some slave is holding
+    // it down to buy time - the I2C-specified way for a slow device to
+    // stall the master. Freezing the entire transfer FSM (including
+    // div_cnt, so the half-period restarts cleanly once the line is
+    // free) is exactly the required response. Qualified by `busy` so an
+    // idle master is never frozen and can still latch a START request.
+    wire stretch_hold = busy && scl_reg && !scl_i;
+
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             state <= S_IDLE; busy <= 1'b0; ack_error <= 1'b0;
             scl_reg <= 1'b1; sda_reg <= 1'b1; sda_oe_reg <= 1'b1;
             div_cnt <= 16'd0; bit_idx <= 4'd0; shift_reg <= 8'd0; rxdata_reg <= 8'd0;
-        end else begin
+        end else if (!stretch_hold) begin
             case (state)
                 S_IDLE, S_HELD: begin
                     if (start_pulse) begin
@@ -288,7 +325,23 @@ module i2c_master (
         end
     end
 
-    assign scl     = scl_reg;
-    assign sda_o    = sda_reg;
-    assign sda_oe   = sda_oe_reg;
+    // §100: the only place the open-drain rule has to be enforced, and
+    // the reason the whole FSM above could stay untouched. `sda_reg` and
+    // `scl_reg` keep their old meaning as the INTENDED line level; what
+    // changes is how that intent reaches the pin.
+    //
+    //   intent 0  -> pull the line low   (oe=1, o=0)
+    //   intent 1  -> release the line    (oe=0; the pull-up makes it 1)
+    //   not ours  -> release the line    (sda_oe_reg=0, e.g. the slave's
+    //                                     ACK slot or a read byte)
+    //
+    // Driving a hard 0 on `o` and gating only `oe` makes "drive high"
+    // unrepresentable rather than merely unused, so no future edit to
+    // the FSM can reintroduce the bug. SCL has no release/own
+    // distinction - a master always owns the clock - so its oe is just
+    // the inverted intent.
+    assign scl_o   = 1'b0;
+    assign scl_oe  = ~scl_reg;
+    assign sda_o   = 1'b0;
+    assign sda_oe  = sda_oe_reg && !sda_reg;
 endmodule

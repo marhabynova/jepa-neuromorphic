@@ -20,6 +20,12 @@
 
 SHELL     := /bin/bash
 RTL       := $(wildcard rtl/*.v)
+# synth_top.v instantiates the iCE40 SB_IO pad primitive for the I2C
+# bidirectional pins, which iverilog has no model for. It is a
+# synthesis-only wrapper that no testbench instantiates (every bench
+# drives soc_top or a sub-module directly), so simulation simply leaves
+# it out; `make synth` still elaborates it through yosys.
+SIM_RTL   := $(filter-out rtl/synth_top.v,$(RTL))
 TB_DIR    := tb
 MODELS    := tb/i2c_slave_model.v tb/spi_slave_model.v
 TOOLS_DIR := tools
@@ -60,7 +66,8 @@ PERIPH_TESTS := \
 	tb_spi \
 	tb_spi_a4_a5 \
 	tb_spi_slave_model \
-	tb_i2c
+	tb_i2c \
+	tb_i2c_open_drain
 
 # Trace-only benches kept from debugging sessions: they print per-edge
 # traces and have no PASS/FAIL verdict of their own. They are still
@@ -97,14 +104,14 @@ test: hex
 	for entry in $(CPU_TESTS); do \
 		tb=$${entry%%:*}; hexfile=$${entry##*:}; \
 		if ! $(IVERILOG) -g2005 -D IMEM_HEX='"$(CURDIR)/$(HEX)/'$$hexfile'"' \
-		      -o $(SIM)/$$tb.out $(RTL) $(TB_DIR)/$$tb.v > $(SIM)/$$tb.compile.log 2>&1; then \
+		      -o $(SIM)/$$tb.out $(SIM_RTL) $(TB_DIR)/$$tb.v > $(SIM)/$$tb.compile.log 2>&1; then \
 			printf '%-26s %s\n' "$$tb" "FAIL (compile)"; cat $(SIM)/$$tb.compile.log; fail=1; continue; fi; \
 		$(VVP) $(SIM)/$$tb.out > $(SIM)/$$tb.log 2>&1 || true; \
 		if grep -q '^PASS' $(SIM)/$$tb.log; then printf '%-26s %s\n' "$$tb" "PASS"; \
 		else printf '%-26s %s\n' "$$tb" "FAIL"; sed 's/^/    | /' $(SIM)/$$tb.log; fail=1; fi; \
 	done; \
 	for tb in $(PERIPH_TESTS); do \
-		if ! $(IVERILOG) -g2005 -o $(SIM)/$$tb.out $(RTL) $(MODELS) $(TB_DIR)/$$tb.v \
+		if ! $(IVERILOG) -g2005 -o $(SIM)/$$tb.out $(SIM_RTL) $(MODELS) $(TB_DIR)/$$tb.v \
 		      > $(SIM)/$$tb.compile.log 2>&1; then \
 			printf '%-26s %s\n' "$$tb" "FAIL (compile)"; cat $(SIM)/$$tb.compile.log; fail=1; continue; fi; \
 		$(VVP) $(SIM)/$$tb.out > $(SIM)/$$tb.log 2>&1 || true; \
@@ -112,7 +119,7 @@ test: hex
 		else printf '%-26s %s\n' "$$tb" "FAIL"; sed 's/^/    | /' $(SIM)/$$tb.log; fail=1; fi; \
 	done; \
 	for tb in $(TRACE_TESTS); do \
-		if ! $(IVERILOG) -g2005 -o $(SIM)/$$tb.out $(RTL) $(MODELS) $(TB_DIR)/$$tb.v \
+		if ! $(IVERILOG) -g2005 -o $(SIM)/$$tb.out $(SIM_RTL) $(MODELS) $(TB_DIR)/$$tb.v \
 		      > $(SIM)/$$tb.compile.log 2>&1; then \
 			printf '%-26s %s\n' "$$tb" "FAIL (compile)"; cat $(SIM)/$$tb.compile.log; fail=1; continue; fi; \
 		if $(VVP) $(SIM)/$$tb.out > $(SIM)/$$tb.log 2>&1; then printf '%-26s %s\n' "$$tb" "ran (trace-only)"; \
