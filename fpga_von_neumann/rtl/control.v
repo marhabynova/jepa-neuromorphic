@@ -22,6 +22,13 @@ module control (
     output       irq_en,
     output       irq_dis,
     output [3:0] alu_op,
+    // §102: sub-word memory access width for LOAD/STORE - 2'b00=byte,
+    // 2'b01=half, 2'b10=word. Only meaningful when mem_to_reg or
+    // mem_write is actually set; cpu.v ignores it otherwise.
+    output [1:0] mem_size,
+    // §102: LOAD only - zero-extend (LBU/LHU) instead of sign-extend
+    // (LB/LH). Meaningless for STORE/word loads.
+    output       load_unsigned,
     // §100: asserted for any encoding this core does NOT implement.
     // Previously such encodings fell into a `default:` arm that left
     // alu_op at ADD with reg_write still set by the enclosing opcode case
@@ -54,7 +61,11 @@ module control (
 
     reg rw, mw, m2r, asrc, br, jp, jr, lu, au, ir, ien, idis, ill;
     reg [3:0] aop;
+    reg [1:0] msize;
+    reg       lu_unsigned;
 
+    assign mem_size     = msize;
+    assign load_unsigned = lu_unsigned;
     assign auipc      = au;
     assign illegal    = ill;
     assign reg_write  = rw;
@@ -70,23 +81,21 @@ module control (
     assign irq_dis    = idis;
     assign alu_op     = aop;
 
-    // Scope after §100: the full RV32I integer-register set except the
-    // sub-word memory accesses, FENCE, ECALL/EBREAK and the CSR ops -
-    // i.e. ADD/SUB/SLL/SLT/SLTU/XOR/SRL/SRA/OR/AND (R-type),
-    // ADDI/SLLI/SLTI/SLTIU/XORI/SRLI/SRAI/ORI/ANDI (I-type), LW, SW,
-    // BEQ/BNE/BLT/BGE/BLTU/BGEU (cpu.v has a dedicated comparator - see
-    // there), LUI, AUIPC, JAL, JALR. §96's IRET/EI/DI (custom-0) stay.
+    // Scope after §102: the full RV32I integer-register set except
+    // FENCE, ECALL/EBREAK and the CSR ops - i.e. ADD/SUB/SLL/SLT/SLTU/
+    // XOR/SRL/SRA/OR/AND (R-type), ADDI/SLLI/SLTI/SLTIU/XORI/SRLI/SRAI/
+    // ORI/ANDI (I-type), LB/LH/LW/LBU/LHU, SB/SH/SW (§102 - cpu.v now
+    // has the byte-lane extract/merge stage dmem.v needed), BEQ/BNE/
+    // BLT/BGE/BLTU/BGEU (cpu.v has a dedicated comparator - see there),
+    // LUI, AUIPC, JAL, JALR. §96's IRET/EI/DI (custom-0) stay.
     //
-    // DELIBERATELY STILL OUT OF SCOPE, and now reported as `illegal`
-    // instead of silently doing something else:
-    //   - LB/LBU/LH/LHU/SB/SH: this datapath has no byte lane / write
-    //     strobe machinery at all (dmem.v is word-only, cpu.v has no
-    //     sub-word extract or merge stage), so these are a datapath
-    //     change, not a decode change - not a cheap addition.
+    // DELIBERATELY STILL OUT OF SCOPE, reported as `illegal` instead of
+    // silently doing something else:
     //   - MUL/DIV (M extension), FENCE, ECALL/EBREAK, all CSR ops.
     always @(*) begin
         rw = 0; mw = 0; m2r = 0; asrc = 0; br = 0; jp = 0; jr = 0; lu = 0;
         au = 0; ir = 0; ien = 0; idis = 0; ill = 0; aop = 4'b0000;
+        msize = 2'b10; lu_unsigned = 0;
 
         case (opcode)
             OP_RTYPE: begin
@@ -138,22 +147,29 @@ module control (
                 endcase
             end
             OP_LOAD: begin
-                // Only LW (funct3=010). LB/LBU/LH/LHU used to be decoded
-                // as LW here because funct3 was ignored entirely.
-                if (funct3 == 3'b010) begin
-                    rw = 1; asrc = 1; m2r = 1; aop = 4'b0000; // address = rs1 + imm
-                end else begin
-                    ill = 1;
-                end
+                // §102: full width/sign-extension set. funct3 000/001/010
+                // = LB/LH/LW (sign-extend), 100/101 = LBU/LHU (zero-extend).
+                // 011/110/111 are unassigned in RV32I.
+                rw = 1; asrc = 1; m2r = 1; aop = 4'b0000; // address = rs1 + imm
+                case (funct3)
+                    3'b000: begin msize = 2'b00; lu_unsigned = 0; end // LB
+                    3'b001: begin msize = 2'b01; lu_unsigned = 0; end // LH
+                    3'b010: begin msize = 2'b10; lu_unsigned = 0; end // LW
+                    3'b100: begin msize = 2'b00; lu_unsigned = 1; end // LBU
+                    3'b101: begin msize = 2'b01; lu_unsigned = 1; end // LHU
+                    default: begin rw = 0; ill = 1; end
+                endcase
             end
             OP_STORE: begin
-                // Only SW (funct3=010). SB/SH used to be decoded as SW,
-                // i.e. a 1-byte store silently clobbered 4 bytes.
-                if (funct3 == 3'b010) begin
-                    mw = 1; asrc = 1; aop = 4'b0000;
-                end else begin
-                    ill = 1;
-                end
+                // §102: funct3 000/001/010 = SB/SH/SW. 011/100-111
+                // unassigned in RV32I.
+                mw = 1; asrc = 1; aop = 4'b0000;
+                case (funct3)
+                    3'b000: msize = 2'b00; // SB
+                    3'b001: msize = 2'b01; // SH
+                    3'b010: msize = 2'b10; // SW
+                    default: begin mw = 0; ill = 1; end
+                endcase
             end
             OP_BRANCH: begin
                 // br=1 is all this stage needs; cpu.v has its own

@@ -1,16 +1,18 @@
 `timescale 1ns/1ps
 
-// §100: the reporting half of the "no silent mis-execution" fix.
-// tb_rv32i_ext.v already proves the ARCHITECTURAL effect (LB/SB change
-// nothing instead of acting as LW/SW); this bench proves the core also
-// KNOWS it rejected something, via control.v's `illegal` and cpu.v's
+// §100/§102: the reporting half of the "no silent mis-execution" fix.
+// tb_rv32i_ext.v already proves the ARCHITECTURAL effect for everything
+// this core DOES implement; this bench proves it also KNOWS when it
+// rejects something it doesn't, via control.v's `illegal` and cpu.v's
 // sticky illegal_seen/illegal_pc.
 //
-// The program (tools/asm_rv32i_ext_test.py) is entirely legal RV32I up
-// to a deliberate `lb x5, 0(x0)` near the end, so:
+// §102 made LB/SB (and the rest of the byte/half set) real instructions,
+// so they can no longer anchor this test - MUL (RV32M, funct7=0000001)
+// takes over that role: the program (tools/asm_rv32i_ext_test.py) is
+// entirely legal RV32I up to a deliberate `mul x5,x1,x2` near the end, so:
 //   - illegal_seen must be 1 (something was rejected), and
 //   - illegal_pc must point at an instruction word that really IS that
-//     LB encoding (0x00000283) - which simultaneously proves no EARLIER,
+//     MUL encoding (0x022082b3) - which simultaneously proves no EARLIER,
 //     legal instruction was wrongly flagged, since illegal_pc latches
 //     the FIRST offender only.
 // Checking the opcode found at illegal_pc instead of a hard-coded
@@ -37,8 +39,9 @@ module tb_illegal_instr;
 
     always #5 clk = ~clk;
 
-    // lb x5, 0(x0) = imm 0 | rs1 x0 | funct3 000 | rd x5 | opcode 0000011
-    localparam [31:0] LB_X5_0_X0 = 32'h00000283;
+    // mul x5, x1, x2 = funct7 0000001 | rs2 x2 | rs1 x1 | funct3 000 |
+    // rd x5 | opcode 0110011 (RV32M, not implemented by this core)
+    localparam [31:0] MUL_X5_X1_X2 = 32'h022082b3;
 
     integer errors;
     reg [31:0] flagged_instr;
@@ -50,15 +53,15 @@ module tb_illegal_instr;
 
         flagged_instr = dut.imem_u.mem[dut.illegal_pc[11:2]];
         $display("illegal_seen = %b (expect 1)", dut.illegal_seen);
-        $display("illegal_pc   = %0d, instruction there = %h (expect %h = lb x5,0(x0))",
-                 dut.illegal_pc, flagged_instr, LB_X5_0_X0);
+        $display("illegal_pc   = %0d, instruction there = %h (expect %h = mul x5,x1,x2)",
+                 dut.illegal_pc, flagged_instr, MUL_X5_X1_X2);
 
         if (dut.illegal_seen !== 1'b1) begin
             $display("  MISMATCH: no illegal instruction was reported at all");
             errors = errors + 1;
         end
-        if (flagged_instr !== LB_X5_0_X0) begin
-            $display("  MISMATCH: illegal_pc points at %h, not the deliberate LB", flagged_instr);
+        if (flagged_instr !== MUL_X5_X1_X2) begin
+            $display("  MISMATCH: illegal_pc points at %h, not the deliberate MUL", flagged_instr);
             errors = errors + 1;
         end
 

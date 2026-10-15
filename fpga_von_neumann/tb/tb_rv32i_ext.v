@@ -1,17 +1,18 @@
 `timescale 1ns/1ps
 
-// §100: directed test for the instructions the audit found missing or
-// silently mis-decoded - SLLI/SRLI/SRAI, SLTI/SLTIU, XORI, R-type SRA
-// and SLTU, BLTU/BGEU, AUIPC - plus the requirement that an
-// unimplemented encoding (LB/SB) does NOT execute as a different
-// instruction.
+// §100/§102: directed test for the instructions the audit found missing
+// or silently mis-decoded - SLLI/SRLI/SRAI, SLTI/SLTIU, XORI, R-type SRA
+// and SLTU, BLTU/BGEU, AUIPC - plus (§102) the full byte/halfword
+// load-store set LB/LH/LBU/LHU/SB/SH, and the requirement that what's
+// STILL unimplemented (MUL) does not execute as a different instruction.
 //
 // Every expectation below comes from the RISC-V unprivileged ISA spec's
-// definition of the instruction, not from reading control.v/alu.v. Every
-// one was also chosen so that the OLD decoder produces a DIFFERENT value
-// (old: all the new I-type ops ran as ADDI, SRA as SRL, SLTU as ADD,
-// BLTU/BGEU never taken, AUIPC a NOP, LB/SB as LW/SW) - verified by
-// running this bench against the pre-fix RTL, where 23 of 25 checks fail.
+// definition of the instruction, not from reading control.v/alu.v/dmem.v.
+// §102's checks read dmem directly (dut.dmem_u.mem[word_index]) rather
+// than a register, because the test program (tools/asm_rv32i_ext_test.py)
+// parks every byte/half result in its own memory word instead of a
+// register - by this point in the program every one of the 31 general
+// registers already has a final value some earlier check depends on.
 //
 // Program: tools/asm_rv32i_ext_test.py (see its header for the encoding
 // rationale and the edge values chosen).
@@ -49,7 +50,10 @@ module tb_rv32i_ext;
         #6000;
 
         // --- shift immediates: shamt 0 and 31, zero-fill vs sign-fill ---
-        chk("slli x1,31",  dut.rf.regs[5],  32'h80000000);
+        // §102: x5 (the slli destination) is reused as scratch later in
+        // the program, so this result was parked at dmem word 32 right
+        // after it was computed - see asm_rv32i_ext_test.py.
+        chk("slli x1,31",  dut.dmem_u.mem[32], 32'h80000000);
         chk("slli x1,0",   dut.rf.regs[6],  32'h00000001);
         chk("srli x3,31",  dut.rf.regs[7],  32'h00000001);
         chk("srai x3,31",  dut.rf.regs[8],  32'hFFFFFFFF);
@@ -84,12 +88,34 @@ module tb_rv32i_ext;
         chk("auipc 0x10 delta",       dut.rf.regs[29], 32'h0000FFFC);
         chk("auipc 0xFFFFF delta",    dut.rf.regs[27], 32'd4100);
 
-        // --- unimplemented encodings must be no-ops, not LW/SW ---
-        chk("lb did not clobber x5",  dut.rf.regs[5],  32'h80000000);
-        chk("sb did not write mem",   dut.rf.regs[28], 32'hFFFFFFFF);
+        // --- §102: SB byte-lane correctness (word index 16, byte 64) ---
+        // Baseline 0x11223344 overwritten one byte at a time; if any SB
+        // had written outside its own lane, this would not reconstruct
+        // to WORD exactly.
+        chk("sb byte-lane reconstruction", dut.dmem_u.mem[16], 32'h9A0281E1);
+
+        // --- §102: SH byte-lane correctness (word index 17, byte 68) ---
+        chk("sh byte-lane reconstruction", dut.dmem_u.mem[17], 32'h9A0281E1);
+
+        // --- §102: LB/LBU/LH/LHU against WORD = 0x9A0281E1 at byte 80 ---
+        // byte0=0xE1, byte1=0x81, byte2=0x02, byte3=0x9A;
+        // half0=0x81E1, half1=0x9A02. Bytes/halves with bit7/bit15 set
+        // genuinely differ between sign- and zero-extend; byte2 doesn't,
+        // which instead checks plain byte-offset alignment.
+        chk("lb  @+0 (sign)",  dut.dmem_u.mem[40], 32'hFFFFFFE1);
+        chk("lbu @+0 (zero)",  dut.dmem_u.mem[41], 32'h000000E1);
+        chk("lb  @+1 (sign)",  dut.dmem_u.mem[42], 32'hFFFFFF81);
+        chk("lbu @+1 (zero)",  dut.dmem_u.mem[43], 32'h00000081);
+        chk("lb  @+2",         dut.dmem_u.mem[44], 32'h00000002);
+        chk("lb  @+3 (sign)",  dut.dmem_u.mem[45], 32'hFFFFFF9A);
+        chk("lbu @+3 (zero)",  dut.dmem_u.mem[46], 32'h0000009A);
+        chk("lh  @+0 (sign)",  dut.dmem_u.mem[47], 32'hFFFF81E1);
+        chk("lhu @+0 (zero)",  dut.dmem_u.mem[48], 32'h000081E1);
+        chk("lh  @+2 (sign)",  dut.dmem_u.mem[49], 32'hFFFF9A02);
+        chk("lhu @+2 (zero)",  dut.dmem_u.mem[50], 32'h00009A02);
 
         if (errors == 0)
-            $display("PASS: SLLI/SRLI/SRAI, SLTI/SLTIU, XORI, SRA, SLTU, BLTU/BGEU and AUIPC all match the RISC-V spec; LB/SB retire as no-ops instead of LW/SW.");
+            $display("PASS: SLLI/SRLI/SRAI, SLTI/SLTIU, XORI, SRA, SLTU, BLTU/BGEU, AUIPC and the full LB/LH/LBU/LHU/SB/SH set all match the RISC-V spec.");
         else
             $display("FAIL: %0d mismatch(es), see above.", errors);
         $finish;

@@ -64,6 +64,8 @@ module cpu (
     wire auipc, illegal;
     wire iret, irq_en, irq_dis;
     wire [3:0] alu_op;
+    wire [1:0] mem_size;
+    wire load_unsigned;
 
     control ctrl (
         .opcode(opcode), .funct3(funct3), .funct7(funct7),
@@ -71,7 +73,8 @@ module cpu (
         .alu_src(alu_src), .branch(branch), .jump(jump), .jalr(jalr), .lui(lui),
         .auipc(auipc),
         .iret(iret), .irq_en(irq_en), .irq_dis(irq_dis),
-        .alu_op(alu_op), .illegal(illegal)
+        .alu_op(alu_op), .illegal(illegal),
+        .mem_size(mem_size), .load_unsigned(load_unsigned)
     );
 
     // Immediate generation for all formats we use (I/S/B/J/U), sign-extended
@@ -150,10 +153,36 @@ module cpu (
     assign mmio_addr  = alu_result;
     assign mmio_wdata = rd_data2;
 
+    // §102: byte/half store alignment. dmem.v is still one 32-bit word
+    // per address (addr[11:2]) with no read-modify-write - instead, the
+    // store data is pre-replicated into every lane here and wstrobe picks
+    // which lane(s) actually get written, so a byte store only needs to
+    // present its 8 bits at whichever of the 4 positions addr[1:0]
+    // selects (dmem then writes only that one byte of the word).
+    reg [3:0]  dmem_wstrobe;
+    reg [31:0] dmem_wdata;
+    always @(*) begin
+        case (mem_size)
+            2'b00: begin // byte
+                dmem_wstrobe = 4'b0001 << alu_result[1:0];
+                dmem_wdata   = {rd_data2[7:0], rd_data2[7:0], rd_data2[7:0], rd_data2[7:0]};
+            end
+            2'b01: begin // half - addr[1] picks the lower or upper 16 bits
+                dmem_wstrobe = alu_result[1] ? 4'b1100 : 4'b0011;
+                dmem_wdata   = {rd_data2[15:0], rd_data2[15:0]};
+            end
+            default: begin // word
+                dmem_wstrobe = 4'b1111;
+                dmem_wdata   = rd_data2;
+            end
+        endcase
+    end
+
     wire [31:0] dmem_rd;
     dmem dmem_u (
-        .clk(clk), .addr(alu_result), .wr_data(rd_data2),
-        .we(mem_write && exec_now && !mmio_sel), .rd_data(dmem_rd)
+        .clk(clk), .addr(alu_result), .wr_data(dmem_wdata),
+        .we(mem_write && exec_now && !mmio_sel), .wstrobe(dmem_wstrobe),
+        .rd_data(dmem_rd)
     );
 
     // LOAD from an MMIO-region address reads mmio_rdata (the attached
@@ -161,7 +190,33 @@ module cpu (
     // driven by alu_result, which stays stable across EXEC->MEM exactly
     // like dmem's address does, so this mux is safe to use combinationally
     // here even though we're now in S_MEM.
-    wire [31:0] load_data = mmio_region ? mmio_rdata : dmem_rd;
+    wire [31:0] load_data_raw = mmio_region ? mmio_rdata : dmem_rd;
+
+    // §102: byte/half load extract + sign/zero-extend. alu_result[1:0]
+    // (the byte offset within the word) is stable here for the same
+    // reason mmio_region is - instr/pc don't change until EXEC->MEM's
+    // own returning_to_fetch edge, which for a load is one cycle LATER
+    // (S_MEM, not S_EXEC) than this comb logic runs in.
+    reg [31:0] load_data;
+    always @(*) begin
+        case (mem_size)
+            2'b00: begin // byte
+                case (alu_result[1:0])
+                    2'b00: load_data = load_unsigned ? {24'd0, load_data_raw[7:0]}   : {{24{load_data_raw[7]}},  load_data_raw[7:0]};
+                    2'b01: load_data = load_unsigned ? {24'd0, load_data_raw[15:8]}  : {{24{load_data_raw[15]}}, load_data_raw[15:8]};
+                    2'b10: load_data = load_unsigned ? {24'd0, load_data_raw[23:16]} : {{24{load_data_raw[23]}}, load_data_raw[23:16]};
+                    default: load_data = load_unsigned ? {24'd0, load_data_raw[31:24]} : {{24{load_data_raw[31]}}, load_data_raw[31:24]};
+                endcase
+            end
+            2'b01: begin // half
+                if (alu_result[1])
+                    load_data = load_unsigned ? {16'd0, load_data_raw[31:16]} : {{16{load_data_raw[31]}}, load_data_raw[31:16]};
+                else
+                    load_data = load_unsigned ? {16'd0, load_data_raw[15:0]}  : {{16{load_data_raw[15]}},  load_data_raw[15:0]};
+            end
+            default: load_data = load_data_raw; // word
+        endcase
+    end
 
     wire [31:0] pc_plus4 = pc + 32'd4;
     // jump covers both JAL and JALR (both write rd<=pc+4, cpu.v's pc_next
