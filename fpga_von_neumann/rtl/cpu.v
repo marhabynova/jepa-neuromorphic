@@ -48,7 +48,7 @@ module cpu (
     // small FETCH/EXEC/MEM FSM instead. Nothing overlaps (no pipelining),
     // so there are no hazards to handle - just an explicit 1-cycle wait
     // after presenting an address, before using what comes back.
-    localparam S_FETCH = 2'd0, S_EXEC = 2'd1, S_MEM = 2'd2;
+    localparam S_FETCH = 2'd0, S_EXEC = 2'd1, S_MEM = 2'd2, S_WB = 2'd3;
     reg [1:0] state;
     reg [31:0] pc;
     wire [31:0] instr;
@@ -97,13 +97,15 @@ module cpu (
         endcase
     end
 
-    // `instr` (and everything decoded from it) stays stable across EXEC and
-    // MEM, because `pc` - imem's read address - only changes on the edge
-    // that returns to FETCH. `returning_to_fetch` marks exactly that edge:
-    // EXEC->FETCH for everything except loads, MEM->FETCH for loads. Every
-    // other transition (FETCH->EXEC, EXEC->MEM) holds pc so addresses stay
-    // valid for memory that's still catching up to a synchronous read.
-    wire returning_to_fetch = (state == S_EXEC && !mem_to_reg) || (state == S_MEM);
+    // `instr` (and everything decoded from it) stays stable across EXEC,
+    // MEM and WB, because `pc` - imem's read address - only changes on the
+    // edge that returns to FETCH. `returning_to_fetch` marks exactly that
+    // edge: EXEC->FETCH for everything except loads, WB->FETCH for loads
+    // (§103 added S_WB between S_MEM and S_FETCH - see load_data_raw_reg
+    // below). Every other transition (FETCH->EXEC, EXEC->MEM, MEM->WB)
+    // holds pc so addresses stay valid for memory that's still catching up
+    // to a synchronous read.
+    wire returning_to_fetch = (state == S_EXEC && !mem_to_reg) || (state == S_WB);
     wire reg_write_now = reg_write && returning_to_fetch;
     wire exec_now = (state == S_EXEC);
 
@@ -192,29 +194,47 @@ module cpu (
     // here even though we're now in S_MEM.
     wire [31:0] load_data_raw = mmio_region ? mmio_rdata : dmem_rd;
 
-    // §102: byte/half load extract + sign/zero-extend. alu_result[1:0]
-    // (the byte offset within the word) is stable here for the same
-    // reason mmio_region is - instr/pc don't change until EXEC->MEM's
-    // own returning_to_fetch edge, which for a load is one cycle LATER
-    // (S_MEM, not S_EXEC) than this comb logic runs in.
+    // §103: load_data_raw is REGISTERED here (captured at the S_MEM->S_WB
+    // edge, one full cycle after it's valid) instead of being consumed
+    // combinationally in the same cycle it arrives. §102's byte/half
+    // extraction mux below sat directly on top of the BRAM's own
+    // clock-to-Q delay in a single cycle (BRAM Q -> extract mux -> wb_data
+    // -> regfile D), and icetime's independent timing check (not nextpnr's
+    // own optimistic self-report - see RESEARCH_NOTES.md §99c) measured
+    // that combined chain at 83.94ns (11.91MHz), ~0.6ns over the 12MHz/
+    // 83.33ns target, consistently across every nextpnr seed tried. This
+    // register breaks that single cycle into two: BRAM Q -> register
+    // (S_MEM->S_WB), then register -> extract mux -> wb_data -> regfile D
+    // (S_WB->S_FETCH) - same total load latency class (one more cycle,
+    // loads already being the slowest instruction), zero change to any
+    // value ever written, since alu_result[1:0]/mem_size/load_unsigned are
+    // all still stable through S_WB for the same reason they were already
+    // stable through S_MEM (instr/pc don't move until S_WB's own
+    // returning_to_fetch edge).
+    reg [31:0] load_data_raw_reg;
+    always @(posedge clk) begin
+        if (state == S_MEM)
+            load_data_raw_reg <= load_data_raw;
+    end
+
     reg [31:0] load_data;
     always @(*) begin
         case (mem_size)
             2'b00: begin // byte
                 case (alu_result[1:0])
-                    2'b00: load_data = load_unsigned ? {24'd0, load_data_raw[7:0]}   : {{24{load_data_raw[7]}},  load_data_raw[7:0]};
-                    2'b01: load_data = load_unsigned ? {24'd0, load_data_raw[15:8]}  : {{24{load_data_raw[15]}}, load_data_raw[15:8]};
-                    2'b10: load_data = load_unsigned ? {24'd0, load_data_raw[23:16]} : {{24{load_data_raw[23]}}, load_data_raw[23:16]};
-                    default: load_data = load_unsigned ? {24'd0, load_data_raw[31:24]} : {{24{load_data_raw[31]}}, load_data_raw[31:24]};
+                    2'b00: load_data = load_unsigned ? {24'd0, load_data_raw_reg[7:0]}   : {{24{load_data_raw_reg[7]}},  load_data_raw_reg[7:0]};
+                    2'b01: load_data = load_unsigned ? {24'd0, load_data_raw_reg[15:8]}  : {{24{load_data_raw_reg[15]}}, load_data_raw_reg[15:8]};
+                    2'b10: load_data = load_unsigned ? {24'd0, load_data_raw_reg[23:16]} : {{24{load_data_raw_reg[23]}}, load_data_raw_reg[23:16]};
+                    default: load_data = load_unsigned ? {24'd0, load_data_raw_reg[31:24]} : {{24{load_data_raw_reg[31]}}, load_data_raw_reg[31:24]};
                 endcase
             end
             2'b01: begin // half
                 if (alu_result[1])
-                    load_data = load_unsigned ? {16'd0, load_data_raw[31:16]} : {{16{load_data_raw[31]}}, load_data_raw[31:16]};
+                    load_data = load_unsigned ? {16'd0, load_data_raw_reg[31:16]} : {{16{load_data_raw_reg[31]}}, load_data_raw_reg[31:16]};
                 else
-                    load_data = load_unsigned ? {16'd0, load_data_raw[15:0]}  : {{16{load_data_raw[15]}},  load_data_raw[15:0]};
+                    load_data = load_unsigned ? {16'd0, load_data_raw_reg[15:0]}  : {{16{load_data_raw_reg[15]}},  load_data_raw_reg[15:0]};
             end
-            default: load_data = load_data_raw; // word
+            default: load_data = load_data_raw_reg; // word
         endcase
     end
 
@@ -318,7 +338,8 @@ module cpu (
             case (state)
                 S_FETCH: state <= S_EXEC;
                 S_EXEC:  state <= mem_to_reg ? S_MEM : S_FETCH; // loads need 1 more cycle
-                S_MEM:   state <= S_FETCH;
+                S_MEM:   state <= S_WB; // §103: extra cycle to register load_data_raw
+                S_WB:    state <= S_FETCH;
                 default: state <= S_FETCH;
             endcase
             if (returning_to_fetch)
