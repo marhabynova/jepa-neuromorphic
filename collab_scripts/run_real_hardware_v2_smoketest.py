@@ -108,5 +108,5 @@ if not MOCK:
           "run_real_hardware_v3_partitioned.py for the real encoder. ***")
 else:
     print("\n*** This was a MOCK-only dry run (zero hardware quota used). "
-          "If it printed cleanly with no error, set MOCK=True -> False "
+          "If it printed cleanly with no error, set MOCK=False "
           "above and re-run for the real smoke test. ***")
