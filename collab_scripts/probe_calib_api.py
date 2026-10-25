@@ -82,7 +82,11 @@ check("default_execution_instance.calib_path",
 # 5. the guard must REFUSE a late attach - if this passes silently, the guard
 #    is useless and a real run could still be calibrated from scratch.
 def _late_attach():
-    exp2 = hxsnn.Experiment(dt=1e-6, mock=True)
+    # mock=False on purpose: under mock=True a module never takes an
+    # execution instance, so this guard has nothing to catch and the test
+    # would be vacuous (it was, until the preflight said "guard is broken").
+    # Constructing modules opens no connection; only hxsnn.run() would.
+    exp2 = hxsnn.Experiment(dt=1e-6, mock=False)
     hxsnn.Synapse(4, 2, exp2)
     try:
         attach_calibration(exp2)
@@ -93,7 +97,7 @@ check("guard refuses attach-after-modules", _late_attach)
 
 
 def _verifier_catches_uncalibrated():
-    e = hxsnn.Experiment(dt=1e-6, mock=True)
+    e = hxsnn.Experiment(dt=1e-6, mock=False)  # see _late_attach
     syn = hxsnn.Synapse(4, 2, e)
     lif = hxsnn.LIF(2, e)
     lif(syn(hxsnn.LIFObservables(spikes=torch.zeros(3, 1, 4))))

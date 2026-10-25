@@ -181,27 +181,45 @@ def attach_calibration(exp, calib_path=None):
 
 
 def assert_calibration_in_effect(exp):
-    """Verify, right before a run, that every module really has the calib.
+    """Verify, right before a run, that the calibration is really in effect.
 
-    The ordering guard above is preventive and depends on an hxtorch internal;
-    this is the actual safety net, and it reads only the documented path a
-    module takes to its execution instance. Call it after the network is
-    built and before hxsnn.run(), so a silent fall-back to a full calix
-    calibration costs a traceback instead of a hardware session.
+    hxtorch binds a module to its execution instance in
+    `HXHardwareEntityMixin.__init__`:
+
+        if execution_instance is None and not self.experiment.mock:
+            execution_instance = self.experiment.default_execution_instance
+        self.execution_instance = execution_instance
+
+    Two consequences, both found the hard way by this check's own self-test:
+    under `mock=True` a module gets NO execution instance at all (so there is
+    nothing to verify, and an earlier version of this function wrongly
+    refused every mock run), and under `mock=False` the binding happens at
+    construction - which is why attach_calibration() must run first.
+
+    `exp.modules.nodes` is only populated when the network graph is built, so
+    it is checked opportunistically; the authoritative check is the default
+    execution instance every module resolves to.
     """
-    modules = list(getattr(getattr(exp, "modules", None), "nodes", None) or [])
-    instances = {id(m.execution_instance): m.execution_instance
-                 for m in modules if getattr(m, "execution_instance", None)}
-    if not instances:
+    if getattr(exp, "mock", False):
+        return  # nothing is bound to an execution instance in mock
+
+    instance = exp.default_execution_instance
+    if not instance.calib_path:
         raise RuntimeError(
-            "no module reports an execution instance - cannot confirm the "
-            "calibration is in effect, refusing to spend hardware time")
-    uncalibrated = [inst for inst in instances.values() if not inst.calib_path]
-    if uncalibrated:
+            "the default execution instance has no calib_path - this run "
+            "would trigger the full on-chip calix calibration (the §108 "
+            "failure). Call attach_calibration(exp) before building modules.")
+    if not os.path.exists(str(instance.calib_path)):
+        raise RuntimeError(f"calib_path missing on disk: {instance.calib_path}")
+
+    nodes = list(getattr(getattr(exp, "modules", None), "nodes", None) or [])
+    stray = [m for m in nodes
+             if getattr(m, "execution_instance", None) is not None
+             and not m.execution_instance.calib_path]
+    if stray:
         raise RuntimeError(
-            f"{len(uncalibrated)} of {len(instances)} execution instance(s) "
-            "have no calib_path; those would trigger the full on-chip calix "
-            "calibration (the §108 failure). Instances: "
-            f"{[str(i) for i in uncalibrated]}")
-    print(f"[calib] verified: {len(modules)} module(s) across "
-          f"{len(instances)} execution instance(s), all with calib_path set")
+            f"{len(stray)} module(s) hold an execution instance without a "
+            f"calib_path: {[type(m).__name__ for m in stray]}")
+    print(f"[calib] verified: default execution instance has "
+          f"{instance.calib_path}" + (f"; {len(nodes)} module(s) checked"
+                                      if nodes else ""))
