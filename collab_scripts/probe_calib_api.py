@@ -1,188 +1,135 @@
-# §109: zero-hardware-quota probe of the hxtorch calibration API.
+# §109d: zero-experiment-quota probe of the hxtorch calibration API.
 #
-# WHY: the §108 real-hardware attempt died mid-run, and the traceback showed
-# it was inside calix's *implicit* full on-chip calibration
-# (ExecutionInstance.calibrate() -> calix.spiking.calibrate -> neuron /
-# synin / membrane-time-constant binary searches). That takes tens of
-# minutes and it is what exhausted the quiggeldy session until
-# lib-rcf.OnDemandUpload gave up ("Encountered 10, aborting!").
+# WHY (§109): the §108 real-hardware run died inside calix's *implicit* full
+# on-chip calibration, not a network fault. v1/v2/v2b/v3 set
+#   exp.calibration = get_nightly_calibration()
+# but that helper returns a lola.Chip (pyNN's `initial_config`), and round 1
+# of this probe then showed 'calibration' is not even in Experiment's class
+# dict - so the assignment was a dead attribute either way and the chip was
+# recalibrated from scratch on every run.
 #
-# Root cause: v1/v2b/v3 all did
-#     exp.calibration = get_nightly_calibration()
-# but helpers.get_nightly_calibration() returns a *lola.Chip* (via
-# pynn.helper.chip_from_file) - that is the pyNN `initial_config` object,
-# NOT an hxtorch calibration. The official hxtorch demo
-# (ts_12-hxtorch_snn_intro.rst) instead does
-#     save_nightly_calibration('spiking_cocolist.pbin')
-#     exp.calibration = calib_helper.fixture_calibration_from_file(
-#         'spiking_cocolist.pbin')
-# with the comment "To avoid time consuming implict calibration we load a
-# prepared calibration".
+# ROUND 1 ANSWERS (both EBRAINS-25.10 and EBRAINS-experimental, identical):
+#   * 'calibration' in vars(Experiment) -> False. Dead attribute, confirmed.
+#   * calibration lives on
+#     ExecutionInstance(calib_path=..., calib_cache_dir=..., input_loopback=)
+#   * ExecutionInstance.calibrate() takes the expensive calix branch only when
+#     `not self.calib_path` AND some module exposes calibration_from_params()
+#     - which our LIF does, because we pass tau_mem/tau_syn/refractory_time.
+#     Set calib_path and that branch is unreachable.
+#   * calib_helper is hxtorch.spiking.utils.calib_helper (NOT
+#     hxtorch.core.utils as the demos assume) and has no
+#     fixture_calibration_from_file; it has calib_from_calix_native,
+#     chip_from_file, chip_from_portable_binary, nightly_calib_path,
+#     nightly_calix_native_path, target_from_calix_native.
 #
-# Before spending more hardware quota, confirm *mechanically* how this
-# version of hxtorch decides to skip calibration, so the fix is verified
-# rather than copied on faith. Everything here is pure introspection +
-# a file download: no init_hardware(), no chip time.
+# WHAT ROUND 1 ALSO TAUGHT ABOUT RUNNING THIS PROBE:
+#   * Several of these calls touch hardware. nightly_calib_path() and
+#     save_nightly_calibration() both end up opening a connection, and with
+#     QUIGGELDY_ENABLED/IP/PORT unset that tries to reach a local FPGA and
+#     takes the whole kernel down - a hard crash, no traceback. So
+#     setup_hardware_client() must run FIRST, before anything else here.
+#   * A hard crash also loses buffered stdout, which is why the reordered
+#     round-2 run printed nothing at all. Everything therefore goes through
+#     P(), which appends to probe_out.txt and flushes - read that file from
+#     a terminal if the kernel dies again.
 #
-# Usage in the Collab notebook (do not retype - pull and exec):
+# Usage in the Collab (pull, don't retype):
+#   import os, sys
+#   os.chdir(os.path.expanduser('~/jepa-neuromorphic'))
+#   sys.path.insert(0, os.path.abspath('ebrains_brainscales2_demos'))
 #   exec(open('collab_scripts/probe_calib_api.py').read())
 
 import inspect
 import os
+import sys
+import traceback
 
-import hxtorch
-import hxtorch.snn as hxsnn
+LOGPATH = "probe_out.txt"
+_log = open(LOGPATH, "w")  # noqa: SIM115  (kept open for the whole probe)
 
-print("=" * 72)
-print("hxtorch module file:", hxtorch.__file__)
-print("hxtorch.snn module file:", hxsnn.__file__)
-print("hxtorch version attr:", getattr(hxtorch, "__version__", "<none>"))
 
-# --- 1. Does Experiment.calibration even exist as a real property? --------
-# If it is NOT a property/attribute of the class, then `exp.calibration = x`
-# silently creates a dead attribute and calibration is never skipped.
-print("=" * 72)
-Experiment = hxsnn.Experiment
-print("'calibration' in Experiment class dict:", "calibration" in vars(Experiment))
-for name, obj in vars(Experiment).items():
-    if "calib" in name.lower():
-        print(f"  Experiment.{name}: {type(obj).__name__}")
+def P(*args):
+    """Print and durably append, so a kernel crash cannot eat the output."""
+    line = " ".join(str(a) for a in args)
+    print(line)
+    sys.stdout.flush()
+    _log.write(line + "\n")
+    _log.flush()
+    os.fsync(_log.fileno())
 
-# --- 2. The actual decision logic that chose calibrate() over the cache ---
-print("=" * 72)
-print("--- Experiment._calibrate source ---")
-try:
-    print(inspect.getsource(Experiment._calibrate))
-except Exception as exc:  # noqa: BLE001
-    print("could not get source:", repr(exc))
 
-# --- 3. ExecutionInstance: where calib actually lives in this version ----
-print("=" * 72)
-try:
-    from hxtorch.spiking.execution_instance import ExecutionInstance
-    print("ExecutionInstance.__init__ signature:")
-    print("  ", inspect.signature(ExecutionInstance.__init__))
-    print("calib-related names on ExecutionInstance:")
-    for name in dir(ExecutionInstance):
-        if "calib" in name.lower():
-            print("  ", name)
-    print("--- ExecutionInstance.calibrate source ---")
-    print(inspect.getsource(ExecutionInstance.calibrate))
-except Exception as exc:  # noqa: BLE001
-    print("ExecutionInstance probe failed:", repr(exc))
+def section(name):
+    P("=" * 72)
+    P("### " + name)
 
-# --- 4. calib_helper: the loader the official demo uses -------------------
-print("=" * 72)
-calib_helper = None
-for modpath in ("hxtorch.core.utils", "hxtorch.spiking.utils", "hxtorch.utils"):
+
+def attempt(label, fn):
+    """Run fn, logging the result or the exception - never abort the probe."""
     try:
-        mod = __import__(modpath, fromlist=["calib_helper"])
-        calib_helper = getattr(mod, "calib_helper")
-        print(f"calib_helper found at {modpath}.calib_helper ->", calib_helper.__file__)
-        break
-    except Exception as exc:  # noqa: BLE001
-        print(f"  {modpath}.calib_helper: {type(exc).__name__}")
-if calib_helper is not None:
-    print("public callables in calib_helper:")
-    for name in dir(calib_helper):
-        if not name.startswith("_") and callable(getattr(calib_helper, name)):
-            try:
-                sig = inspect.signature(getattr(calib_helper, name))
-            except (TypeError, ValueError):
-                sig = "<no signature>"
-            print(f"   {name}{sig}")
+        return fn()
+    except Exception:  # noqa: BLE001
+        P(f"{label}: RAISED")
+        P(traceback.format_exc().strip())
+        return None
 
-# --- 5/6. ROUND 2 (§109b): the questions round 1 opened -------------------
-# Round 1 (EBRAINS-25.10 kernel) established:
-#   * 'calibration' is NOT in Experiment's class dict -> `exp.calibration = x`
-#     is a dead attribute. Both the old code AND the first attempt at a fix
-#     were wrong.
-#   * calibration lives on ExecutionInstance(calib_path=..., calib_cache_dir=...)
-#   * ExecutionInstance.calibrate() runs the expensive calix path only when
-#     `not self.calib_path` AND some module exposes calibration_from_params()
-#     (which our LIF does, because we pass tau_mem/tau_syn/refractory_time).
-#     With calib_path set, that branch is never taken.
-#   * calib_helper lives at hxtorch.spiking.utils.calib_helper (NOT
-#     hxtorch.core.utils as the demos assume) and has NO
-#     fixture_calibration_from_file at all.
-# So: what exactly does calib_path want, and is a local nightly file already
-# on disk (making the openproject.bioai.eu download unnecessary)?
-print("=" * 72)
-print("LAB_KERNEL_NAME:", os.environ.get("LAB_KERNEL_NAME"))
-print("LAB_IMAGE_NAME:", os.environ.get("LAB_IMAGE_NAME"))
 
-try:
-    from hxtorch.spiking.execution_instance import ExecutionInstance
-    print("--- ExecutionInstance.load_calib source ---")
-    print(inspect.getsource(ExecutionInstance.load_calib))
-except Exception as exc:  # noqa: BLE001
-    print("load_calib probe failed:", repr(exc))
+# --- 0. hardware client FIRST: everything below may open a connection -----
+section("0. environment + quiggeldy setup (must precede any hardware touch)")
+P("LAB_KERNEL_NAME:", os.environ.get("LAB_KERNEL_NAME"))
+P("LAB_IMAGE_NAME:", os.environ.get("LAB_IMAGE_NAME"))
+attempt("setup_hardware_client", lambda: __import__(
+    "_static.common.helpers", fromlist=["setup_hardware_client"]
+).setup_hardware_client())
+P("QUIGGELDY_ENABLED:", os.environ.get("QUIGGELDY_ENABLED"))
+P("QUIGGELDY_IP:", os.environ.get("QUIGGELDY_IP"))
+P("QUIGGELDY_PORT:", os.environ.get("QUIGGELDY_PORT"))
 
-if calib_helper is not None:
-    for fname in ("nightly_calib_path", "nightly_calix_native_path"):
-        try:
-            val = getattr(calib_helper, fname)()
-            print(f"{fname}() = {val}  exists={os.path.exists(str(val))}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"{fname}() raised: {exc!r}")
+import hxtorch  # noqa: E402
+import hxtorch.snn as hxsnn  # noqa: E402
 
-# Signatures we need to actually wire calib_path through to the modules.
-print("--- signatures ---")
+section("1. module locations")
+P("hxtorch:", hxtorch.__file__)
+P("hxtorch.snn:", hxsnn.__file__)
+
+section("2. is Experiment.calibration a real property?")
+P("'calibration' in vars(Experiment):", "calibration" in vars(hxsnn.Experiment))
+
+section("3. ExecutionInstance: the real calibration owner")
+from hxtorch.spiking.execution_instance import ExecutionInstance  # noqa: E402
+P("__init__:", inspect.signature(ExecutionInstance.__init__))
+P("--- load_calib source ---")
+P(attempt("load_calib", lambda: inspect.getsource(ExecutionInstance.load_calib)))
+
+section("4. calib_helper + where a prepared calibration already lives")
+from hxtorch.spiking.utils import calib_helper  # noqa: E402
+P("calib_helper:", calib_helper.__file__)
+for fname in ("nightly_calib_path", "nightly_calix_native_path"):
+    def _probe(fname=fname):
+        val = getattr(calib_helper, fname)()
+        P(f"{fname}() = {val}  exists={os.path.exists(str(val))}")
+    attempt(fname, _probe)
+
+section("5. signatures needed to wire an ExecutionInstance through")
 for obj, label in ((hxsnn.Experiment.__init__, "Experiment.__init__"),
                    (hxsnn.Synapse.__init__, "Synapse.__init__"),
                    (hxsnn.LIF.__init__, "LIF.__init__")):
-    try:
-        print(f"{label}{inspect.signature(obj)}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"{label}: {exc!r}")
+    attempt(label, lambda obj=obj, label=label: P(f"{label}{inspect.signature(obj)}"))
 
-# Confirm the trigger: does LIF really expose calibration_from_params?
-print("LIF has calibration_from_params:", hasattr(hxsnn.LIF, "calibration_from_params"))
-print("LIF has params_from_calibration:", hasattr(hxsnn.LIF, "params_from_calibration"))
-print("=" * 72)
+section("6. confirm the trigger for the expensive calix branch")
+P("LIF.calibration_from_params:", hasattr(hxsnn.LIF, "calibration_from_params"))
+P("LIF.params_from_calibration:", hasattr(hxsnn.LIF, "params_from_calibration"))
 
-# --- 7. Download the nightly calib file and show what the loader returns --
-# Download only (no chip access beyond the identifier handshake that
-# save_nightly_calibration itself needs); no init_hardware, no experiment.
-print("=" * 72)
-# Guarded: the demos' helpers module runs check_kernel() at import time and
-# raises on any kernel but EBRAINS-experimental, which must not abort the
-# rest of this probe.
-FN = "spiking_cocolist.pbin"
-try:
-    from _static.common.helpers import (save_nightly_calibration,
-                                        setup_hardware_client)
-    # MUST come first: save_nightly_calibration opens a ManagedConnection to
-    # read the chip identifier, and without QUIGGELDY_ENABLED/IP/PORT that
-    # tries to talk to a local FPGA and takes the whole kernel down with it
-    # (observed twice: hard crash, no traceback, on an otherwise idle kernel).
-    setup_hardware_client()
-    print("[probe] quiggeldy:", os.environ.get("QUIGGELDY_IP"),
-          os.environ.get("QUIGGELDY_PORT"),
-          "enabled=", os.environ.get("QUIGGELDY_ENABLED"))
-    save_nightly_calibration(FN)
-    print(f"{FN}: exists={os.path.exists(FN)} size={os.path.getsize(FN)} bytes")
-except Exception as exc:  # noqa: BLE001
-    print("save_nightly_calibration failed:", repr(exc))
+section("7. does constructing an ExecutionInstance with calib_path work?")
+def _ctor():
+    path = calib_helper.nightly_calix_native_path()
+    inst = ExecutionInstance(calib_path=path)
+    P("ExecutionInstance(calib_path=...) ok; calib_path =", inst.calib_path)
+    P("instance attrs of interest:",
+      {k: type(v).__name__ for k, v in vars(inst).items()
+       if "calib" in k.lower() or "chip" in k.lower()})
+attempt("ExecutionInstance(calib_path=...)", _ctor)
 
-if calib_helper is not None and os.path.exists(FN):
-    try:
-        calib_obj = calib_helper.fixture_calibration_from_file(FN)
-        print("fixture_calibration_from_file ->", type(calib_obj).__module__
-              + "." + type(calib_obj).__name__)
-    except Exception as exc:  # noqa: BLE001
-        print("fixture_calibration_from_file failed:", repr(exc))
-
-# For contrast: what the (wrongly used) pyNN helper returns.
-try:
-    from _static.common.helpers import get_nightly_calibration
-    chip_obj = get_nightly_calibration(FN)
-    print("get_nightly_calibration ->", type(chip_obj).__module__
-          + "." + type(chip_obj).__name__, "  <-- pyNN initial_config, not an hxtorch calib")
-except Exception as exc:  # noqa: BLE001
-    print("get_nightly_calibration probe failed:", repr(exc))
-
-
-print("=" * 72)
-print("*** Probe done. ZERO hardware experiment quota used (no init_hardware,"
-      " no hxsnn.run). Paste the whole output back. ***")
+P("=" * 72)
+P("*** Probe done. ZERO hardware experiment quota used (no init_hardware, "
+  f"no hxsnn.run). Full output also saved to {os.path.abspath(LOGPATH)} ***")
+_log.close()
