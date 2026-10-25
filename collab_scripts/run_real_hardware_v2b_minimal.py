@@ -28,63 +28,21 @@
 # don't retype it into a cell.
 
 import os
+import sys
 
 import torch
 import hxtorch
 import hxtorch.snn as hxsnn
 import pygrenade_vx as grenade
-from _static.common.helpers import (setup_hardware_client,
-                                    save_nightly_calibration)
 
-# --- §109 calibration fix -------------------------------------------------
-# The §108 run burned its whole hardware session inside calix's *implicit*
-# full on-chip calibration and then died on lib-rcf upload timeouts. Reason:
-# helpers.get_nightly_calibration() returns a lola.Chip (the pyNN
-# `initial_config` object), NOT an hxtorch calibration, so assigning it to
-# exp.calibration never satisfied hxtorch and it recalibrated from scratch.
-# The official hxtorch demo (ts_12-hxtorch_snn_intro.rst) uses
-# save_nightly_calibration() + calib_helper.fixture_calibration_from_file(),
-# with the comment "To avoid time consuming implict calibration we load a
-# prepared calibration". Do that, and pre-flight it so a silent miss costs
-# a second instead of a whole session.
-NIGHTLY_CALIB = "spiking_cocolist.pbin"
+# §109e: all BSS-2 connection + prepared-calibration logic lives in
+# collab_scripts/bss2_calib.py, which documents why none of the obvious
+# routes (exp.calibration, the demos' helpers, calib_helper's nightly paths)
+# work on the deployed hxtorch. Scripts here are exec()'d from the repo root,
+# so __file__ is undefined - resolve the import by cwd.
+sys.path.insert(0, os.path.join(os.getcwd(), "collab_scripts"))
+from bss2_calib import setup_hardware_client, attach_calibration  # noqa: E402
 
-
-def _calib_helper():
-    last = None
-    for modpath in ("hxtorch.core.utils", "hxtorch.spiking.utils", "hxtorch.utils"):
-        try:
-            return getattr(__import__(modpath, fromlist=["calib_helper"]),
-                           "calib_helper")
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-    raise ImportError(f"calib_helper not found in any known location: {last!r}")
-
-
-def attach_nightly_calibration(exp):
-    """Load the prepared nightly calibration onto `exp`, or fail loudly.
-
-    Must be called BEFORE hxtorch.init_hardware(): save_nightly_calibration
-    opens its own ManagedConnection to read the chip identifier, which is
-    how the demo orders it too.
-    """
-    if "calibration" not in vars(type(exp)):
-        raise RuntimeError(
-            "hxsnn.Experiment has no 'calibration' property in this hxtorch "
-            "version - assigning it would be a dead attribute and the chip "
-            "would be implicitly recalibrated (the §108 failure). Set the "
-            "calibration on the ExecutionInstance instead; run "
-            "collab_scripts/probe_calib_api.py to see the real API.")
-    save_nightly_calibration(NIGHTLY_CALIB)
-    if not os.path.exists(NIGHTLY_CALIB):
-        raise RuntimeError(f"{NIGHTLY_CALIB} was not downloaded")
-    exp.calibration = _calib_helper().fixture_calibration_from_file(NIGHTLY_CALIB)
-    if exp.calibration is None:
-        raise RuntimeError("exp.calibration is still None after loading")
-    print(f"[calib] loaded {NIGHTLY_CALIB} "
-          f"({os.path.getsize(NIGHTLY_CALIB)} B) -> "
-          f"{type(exp.calibration).__name__}; implicit calibration skipped")
-# --------------------------------------------------------------------------
 
 
 # SAFETY: same convention as v1/v2 - MOCK=True by default, flip only after a
@@ -107,8 +65,11 @@ def run_once(mock: bool):
     exp = hxsnn.Experiment(dt=1e-6, mock=mock)
     try:
         if not mock:
-            # download+load the calib BEFORE init_hardware (demo order)
-            attach_nightly_calibration(exp)
+            # Attach the prepared calibration BEFORE init_hardware() and
+            # before any module is built: the download opens its own
+            # connection to read the chip identifier, and modules bind to
+            # the execution instance at construction time.
+            attach_calibration(exp)
             hxtorch.init_hardware()
             # §108 fix: use GreedyRouter directly, not the default
             # PortfolioRouter - see module docstring above.
