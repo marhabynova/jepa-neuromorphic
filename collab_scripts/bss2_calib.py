@@ -28,16 +28,31 @@ actual EBRAINS kernels (see RESEARCH_NOTES.md §109). The short version:
    it points at `/wang/data/calibration/...`, a Heidelberg-internal path not
    mounted in the collaboratory, and it calls
    `_hxtorch_core.get_unique_identifier()` OUTSIDE a connection, which hard
-   crashes the kernel (no traceback - this killed three probe runs). The
-   identifier must be read inside an `hxcomm.ManagedConnection()`.
+   crashes the kernel (no traceback - this killed three probe runs). Point 7
+   below removes the need for it entirely.
 
 5. We do NOT import `_static.common.helpers`: it runs `check_kernel()` at
-   import time and hard-fails on anything but EBRAINS-experimental, while
-   the calibration files are only published under `ebrains-stable`
-   (verified: ebrains-stable/spiking_calix-native.pkl -> HTTP 200,
-   ebrains-experimental/... -> HTTP 404). So `setup_hardware_client` is
-   inlined here, minus the kernel check, and the download URL is built
-   directly.
+   import time and hard-fails on anything but EBRAINS-experimental, and it
+   hardcodes the experimental quiggeldy setup list. So connection setup is
+   inlined here and the download URL is built directly.
+
+6. THE KERNEL FLAVOUR PICKS EVERYTHING, AND MIXING THEM FAILS. There are two
+   parallel deployments, each with its own quiggeldy setup, its own chip and
+   its own calibration folder. Measured, not assumed:
+
+       kernel            setup list                          port    chip                    calib folder
+       EBRAINS-25.10     quiggeldy_setups.csv                11717   hxcube7fpga3chip61_1    ebrains-stable
+       EBRAINS-exp...    quiggeldy_setups_experimental.csv   11750   hxcube7fpga0chip57_1    ebrains-experimental
+
+   The matching pairs serve the .pkl with HTTP 200; both cross combinations
+   return 404. Pointing a stable kernel at the experimental quiggeldy (what
+   copying the demos' helper verbatim does) fails earlier and more cryptically,
+   with "QuiggeldyConnection Could not request munge status from remote site:
+   Input data format error" out of get_unique_identifier().
+
+7. The setup CSVs carry an `Identifier` column, so the chip name is known
+   without opening a connection at all. That removes the whole class of
+   crashes in point 4 - nothing here needs hardware before init_hardware().
 """
 
 import hashlib
@@ -45,42 +60,60 @@ import os
 import urllib.request
 
 import pandas as pd
-from dlens_vx_v3 import hxcomm
 
 from hxtorch.spiking.execution_instance import ExecutionInstance
 
-QUIGGELDY_SETUPS_URL = ("https://quiggeldy.bioai.eu/nmpi/"
-                        "quiggeldy_setups_experimental.csv")
+SETUPS_URL_TEMPLATE = "https://quiggeldy.bioai.eu/nmpi/{csv}"
 CALIB_FILE = "spiking_calix-native.pkl"
 CALIB_URL_TEMPLATE = ("https://openproject.bioai.eu/data_calibration/"
-                      "hicann-dls-sr-hx/{identifier}/stable/ebrains-stable/"
+                      "hicann-dls-sr-hx/{identifier}/stable/ebrains-{flavour}/"
                       "{filename}")
 
 
-def setup_hardware_client():
-    """Point this kernel at its assigned quiggeldy setup.
+def kernel_flavour():
+    """'experimental' or 'stable' - see point 6 in the module docstring."""
+    return ("experimental"
+            if "experimental" in (os.environ.get("LAB_KERNEL_NAME") or "")
+            else "stable")
 
-    Inlined from the demos' `_static.common.helpers.setup_hardware_client`,
-    minus the EBRAINS-experimental kernel check - see point 5 above. The
-    setup is chosen by a stable hash of the JupyterHub username, so the same
-    user always lands on the same chip.
+
+def _setups():
+    csv = ("quiggeldy_setups_experimental.csv" if kernel_flavour() == "experimental"
+           else "quiggeldy_setups.csv")
+    return pd.read_csv(SETUPS_URL_TEMPLATE.format(csv=csv), dtype=str)
+
+
+def my_setup():
+    """The quiggeldy setup assigned to this user, as a (host, port, chip) row.
+
+    Assignment is a stable hash of the JupyterHub username, so the same user
+    always lands on the same chip - the same rule the demos use.
     """
-    setups = pd.read_csv(QUIGGELDY_SETUPS_URL, dtype=str)
+    setups = _setups()
     username = os.environ.get("JUPYTERHUB_USER")
     assert username is not None, "not running in the EBRAINS collaboratory"
     index = int(hashlib.sha256(username.encode()).hexdigest(), 16) % len(setups)
-    setup = setups.iloc[index]
+    return username, setups.iloc[index]
+
+
+def setup_hardware_client():
+    """Point this kernel at the quiggeldy setup matching its flavour."""
+    username, setup = my_setup()
     os.environ["QUIGGELDY_ENABLED"] = "1"
     os.environ["QUIGGELDY_USER_NO_MUNGE"] = username
     os.environ["QUIGGELDY_IP"] = setup["Host"]
     os.environ["QUIGGELDY_PORT"] = setup["Port"]
-    return setup["Host"], setup["Port"]
+    return (kernel_flavour(), setup["Host"], setup["Port"], setup["Identifier"])
 
 
 def chip_identifier():
-    """Read the assigned chip's identifier - only valid inside a connection."""
-    with hxcomm.ManagedConnection() as connection:
-        return connection.get_unique_identifier()[0]
+    """The assigned chip's name, read from the setup list.
+
+    Deliberately NOT `_hxtorch_core.get_unique_identifier()`: calling that
+    outside a connection hard crashes the kernel (point 4), and calling it
+    inside one needs a working connection we do not have yet.
+    """
+    return my_setup()[1]["Identifier"]
 
 
 def fetch_nightly_calib(filename=CALIB_FILE, force=False):
@@ -92,6 +125,7 @@ def fetch_nightly_calib(filename=CALIB_FILE, force=False):
     if os.path.exists(filename) and not force:
         return os.path.abspath(filename)
     url = CALIB_URL_TEMPLATE.format(identifier=chip_identifier(),
+                                    flavour=kernel_flavour(),
                                     filename=filename)
     urllib.request.urlretrieve(url, filename)
     return os.path.abspath(filename)
