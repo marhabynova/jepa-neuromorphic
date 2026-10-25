@@ -39,7 +39,8 @@ import pygrenade_vx as grenade
 # work on the deployed hxtorch. Scripts here are exec()'d from the repo root,
 # so __file__ is undefined - resolve the import by cwd.
 sys.path.insert(0, os.path.join(os.getcwd(), "collab_scripts"))
-from bss2_calib import setup_hardware_client, attach_calibration  # noqa: E402
+from bss2_calib import (setup_hardware_client, attach_calibration,  # noqa: E402
+                        assert_calibration_in_effect)
 
 
 
@@ -102,6 +103,8 @@ def run_fc1_partition(part_idx: int, mock: bool):
         gb = bias_syn(hxsnn.LIFObservables(spikes=ones))
         z = lif(g, gb)
 
+        if not mock:
+            assert_calibration_in_effect(exp)
         hxsnn.run(exp, T)
         return z.spikes.detach()  # (T, batch, HID_PART)
     finally:
@@ -149,6 +152,8 @@ def run_fc2_fc3(hidden_spikes: torch.Tensor, mock: bool):
         gb3 = bsyn3(hxsnn.LIFObservables(spikes=ones))
         z3 = lif3(g3, gb3)
 
+        if not mock:
+            assert_calibration_in_effect(exp)
         hxsnn.run(exp, T)
         return z3.spikes.detach()  # (T, batch, OUT)
     finally:

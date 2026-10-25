@@ -54,7 +54,8 @@ import torch  # noqa: E402
 import hxtorch  # noqa: E402
 import hxtorch.snn as hxsnn  # noqa: E402
 from bss2_calib import (setup_hardware_client, chip_identifier,  # noqa: E402
-                        fetch_nightly_calib, attach_calibration, CALIB_FILE)
+                        fetch_nightly_calib, attach_calibration, CALIB_FILE,
+                        assert_calibration_in_effect)
 
 P("hxtorch:", hxtorch.__file__)
 
@@ -90,6 +91,19 @@ def _late_attach():
     raise AssertionError("late attach was NOT refused - guard is broken")
 check("guard refuses attach-after-modules", _late_attach)
 
+
+def _verifier_catches_uncalibrated():
+    e = hxsnn.Experiment(dt=1e-6, mock=True)
+    syn = hxsnn.Synapse(4, 2, e)
+    lif = hxsnn.LIF(2, e)
+    lif(syn(hxsnn.LIFObservables(spikes=torch.zeros(3, 1, 4))))
+    try:
+        assert_calibration_in_effect(e)
+    except RuntimeError as exc:
+        return f"correctly refused: {str(exc)[:90]}"
+    raise AssertionError("verifier did NOT catch a network with no calibration")
+check("verifier catches an uncalibrated network", _verifier_catches_uncalibrated)
+
 # 6. a mock forward pass through the same shape v2b uses, so the wiring is
 #    known good before any quota is spent.
 def _mock_pass():
@@ -102,6 +116,7 @@ def _mock_pass():
                     enable_cadc_recording=True, enable_spike_recording=True)
     x = (torch.rand(12, 2, 50) < 0.15).float()
     z = lif(syn(hxsnn.LIFObservables(spikes=x)))
+    assert_calibration_in_effect(e)
     hxsnn.run(e, 12)
     rates = (z.spikes.sum(0) / 12).detach()
     return f"mock rates shape={tuple(rates.shape)} sum={rates.sum().item():.4f}"

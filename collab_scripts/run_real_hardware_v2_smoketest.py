@@ -37,7 +37,8 @@ import pygrenade_vx as grenade
 # work on the deployed hxtorch. Scripts here are exec()'d from the repo root,
 # so __file__ is undefined - resolve the import by cwd.
 sys.path.insert(0, os.path.join(os.getcwd(), "collab_scripts"))
-from bss2_calib import setup_hardware_client, attach_calibration  # noqa: E402
+from bss2_calib import (setup_hardware_client, attach_calibration,  # noqa: E402
+                        assert_calibration_in_effect)
 
 
 
@@ -99,6 +100,8 @@ def run_once(mock: bool):
         gb2 = bsyn2(hxsnn.LIFObservables(spikes=ones))
         z2 = lif2(g2, gb2)
 
+        if not mock:
+            assert_calibration_in_effect(exp)
         hxsnn.run(exp, T)
         return (z2.spikes.sum(0) / T).detach()  # (batch, OUT)
     finally:

@@ -146,12 +146,20 @@ def attach_calibration(exp, calib_path=None):
             "hxsnn.Experiment has no 'default_execution_instance' property in "
             "this hxtorch build; re-run collab_scripts/probe_calib_api.py and "
             "find where the ExecutionInstance is meant to be attached.")
-    built = getattr(getattr(exp, "modules", None), "nodes", None)
-    if built:
+    # The preflight proved `exp.modules.nodes` is the WRONG signal here: it
+    # stays empty until a module is *called*, while the binding we care about
+    # happens in the module's __init__, which reads
+    # exp.default_execution_instance. That getter lazily creates an instance
+    # and caches it in _default_execution_instance - so a non-None cache is
+    # exactly "something already took the default", and a later swap would
+    # not reach it.
+    cached = getattr(exp, "_default_execution_instance", None)
+    if cached is not None:
         raise RuntimeError(
-            "attach_calibration() called after modules were already built - "
-            "they are bound to the old execution instance and would still be "
-            "calibrated from scratch.")
+            "attach_calibration() called after the default execution instance "
+            f"was already handed out ({cached}) - whatever took it is bound to "
+            "that instance and would still be calibrated from scratch. Attach "
+            "before constructing any module.")
 
     calib_path = calib_path or fetch_nightly_calib()
     if not os.path.exists(calib_path):
@@ -170,3 +178,30 @@ def attach_calibration(exp, calib_path=None):
           f"{instance}; the implicit calix calibration branch is now "
           "unreachable")
     return instance
+
+
+def assert_calibration_in_effect(exp):
+    """Verify, right before a run, that every module really has the calib.
+
+    The ordering guard above is preventive and depends on an hxtorch internal;
+    this is the actual safety net, and it reads only the documented path a
+    module takes to its execution instance. Call it after the network is
+    built and before hxsnn.run(), so a silent fall-back to a full calix
+    calibration costs a traceback instead of a hardware session.
+    """
+    modules = list(getattr(getattr(exp, "modules", None), "nodes", None) or [])
+    instances = {id(m.execution_instance): m.execution_instance
+                 for m in modules if getattr(m, "execution_instance", None)}
+    if not instances:
+        raise RuntimeError(
+            "no module reports an execution instance - cannot confirm the "
+            "calibration is in effect, refusing to spend hardware time")
+    uncalibrated = [inst for inst in instances.values() if not inst.calib_path]
+    if uncalibrated:
+        raise RuntimeError(
+            f"{len(uncalibrated)} of {len(instances)} execution instance(s) "
+            "have no calib_path; those would trigger the full on-chip calix "
+            "calibration (the §108 failure). Instances: "
+            f"{[str(i) for i in uncalibrated]}")
+    print(f"[calib] verified: {len(modules)} module(s) across "
+          f"{len(instances)} execution instance(s), all with calib_path set")
