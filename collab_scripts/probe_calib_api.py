@@ -92,40 +92,7 @@ if calib_helper is not None:
                 sig = "<no signature>"
             print(f"   {name}{sig}")
 
-# --- 5. Download the nightly calib file and show what the loader returns --
-# Download only (no chip access beyond the identifier handshake that
-# save_nightly_calibration itself needs); no init_hardware, no experiment.
-print("=" * 72)
-# Guarded: the demos' helpers module runs check_kernel() at import time and
-# raises on any kernel but EBRAINS-experimental, which must not abort the
-# rest of this probe.
-FN = "spiking_cocolist.pbin"
-try:
-    from _static.common.helpers import save_nightly_calibration
-    save_nightly_calibration(FN)
-    print(f"{FN}: exists={os.path.exists(FN)} size={os.path.getsize(FN)} bytes")
-except Exception as exc:  # noqa: BLE001
-    print("save_nightly_calibration failed:", repr(exc))
-
-if calib_helper is not None and os.path.exists(FN):
-    try:
-        calib_obj = calib_helper.fixture_calibration_from_file(FN)
-        print("fixture_calibration_from_file ->", type(calib_obj).__module__
-              + "." + type(calib_obj).__name__)
-    except Exception as exc:  # noqa: BLE001
-        print("fixture_calibration_from_file failed:", repr(exc))
-
-# For contrast: what the (wrongly used) pyNN helper returns.
-try:
-    from _static.common.helpers import get_nightly_calibration
-    chip_obj = get_nightly_calibration(FN)
-    print("get_nightly_calibration ->", type(chip_obj).__module__
-          + "." + type(chip_obj).__name__, "  <-- pyNN initial_config, not an hxtorch calib")
-except Exception as exc:  # noqa: BLE001
-    print("get_nightly_calibration probe failed:", repr(exc))
-
-
-# --- 6. ROUND 2 (§109b): the questions round 1 opened -------------------
+# --- 5/6. ROUND 2 (§109b): the questions round 1 opened -------------------
 # Round 1 (EBRAINS-25.10 kernel) established:
 #   * 'calibration' is NOT in Experiment's class dict -> `exp.calibration = x`
 #     is a dead attribute. Both the old code AND the first attempt at a fix
@@ -173,6 +140,48 @@ for obj, label in ((hxsnn.Experiment.__init__, "Experiment.__init__"),
 print("LIF has calibration_from_params:", hasattr(hxsnn.LIF, "calibration_from_params"))
 print("LIF has params_from_calibration:", hasattr(hxsnn.LIF, "params_from_calibration"))
 print("=" * 72)
+
+# --- 7. Download the nightly calib file and show what the loader returns --
+# Download only (no chip access beyond the identifier handshake that
+# save_nightly_calibration itself needs); no init_hardware, no experiment.
+print("=" * 72)
+# Guarded: the demos' helpers module runs check_kernel() at import time and
+# raises on any kernel but EBRAINS-experimental, which must not abort the
+# rest of this probe.
+FN = "spiking_cocolist.pbin"
+try:
+    from _static.common.helpers import (save_nightly_calibration,
+                                        setup_hardware_client)
+    # MUST come first: save_nightly_calibration opens a ManagedConnection to
+    # read the chip identifier, and without QUIGGELDY_ENABLED/IP/PORT that
+    # tries to talk to a local FPGA and takes the whole kernel down with it
+    # (observed twice: hard crash, no traceback, on an otherwise idle kernel).
+    setup_hardware_client()
+    print("[probe] quiggeldy:", os.environ.get("QUIGGELDY_IP"),
+          os.environ.get("QUIGGELDY_PORT"),
+          "enabled=", os.environ.get("QUIGGELDY_ENABLED"))
+    save_nightly_calibration(FN)
+    print(f"{FN}: exists={os.path.exists(FN)} size={os.path.getsize(FN)} bytes")
+except Exception as exc:  # noqa: BLE001
+    print("save_nightly_calibration failed:", repr(exc))
+
+if calib_helper is not None and os.path.exists(FN):
+    try:
+        calib_obj = calib_helper.fixture_calibration_from_file(FN)
+        print("fixture_calibration_from_file ->", type(calib_obj).__module__
+              + "." + type(calib_obj).__name__)
+    except Exception as exc:  # noqa: BLE001
+        print("fixture_calibration_from_file failed:", repr(exc))
+
+# For contrast: what the (wrongly used) pyNN helper returns.
+try:
+    from _static.common.helpers import get_nightly_calibration
+    chip_obj = get_nightly_calibration(FN)
+    print("get_nightly_calibration ->", type(chip_obj).__module__
+          + "." + type(chip_obj).__name__, "  <-- pyNN initial_config, not an hxtorch calib")
+except Exception as exc:  # noqa: BLE001
+    print("get_nightly_calibration probe failed:", repr(exc))
+
 
 print("=" * 72)
 print("*** Probe done. ZERO hardware experiment quota used (no init_hardware,"
