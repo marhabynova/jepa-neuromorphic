@@ -42,10 +42,15 @@ from bss2_calib import (setup_hardware_client, attach_calibration,  # noqa: E402
 
 
 
-# SAFETY: same convention as v1 - MOCK=True by default, flip only after a
-# clean mock pass. Run with MOCK=True first (zero hardware quota), confirm
-# it prints cleanly, THEN flip to False.
-MOCK = True
+# SAFETY: mock by default, and the real run is opted into from the
+# environment rather than by editing this file - so flipping it is a
+# deliberate act that leaves no uncommitted edit behind (previous
+# sessions flipped `MOCK` in place and the file on disk then disagreed
+# with the repo). Run the mock pass first; it costs zero quota and
+# catches script-level bugs. Then:
+#     os.environ["REAL_HARDWARE"] = "1"
+# and re-run in a FRESH kernel.
+MOCK = os.environ.get("REAL_HARDWARE", "0") != "1"
 
 torch.manual_seed(42)
 
