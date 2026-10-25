@@ -25,10 +25,64 @@
 # don't retype it into a cell.
 
 import json
+import os
+
 import torch
 import hxtorch
 import hxtorch.snn as hxsnn
-from _static.common.helpers import setup_hardware_client, get_nightly_calibration
+from _static.common.helpers import (setup_hardware_client,
+                                    save_nightly_calibration)
+
+# --- §109 calibration fix -------------------------------------------------
+# The §108 run burned its whole hardware session inside calix's *implicit*
+# full on-chip calibration and then died on lib-rcf upload timeouts. Reason:
+# helpers.get_nightly_calibration() returns a lola.Chip (the pyNN
+# `initial_config` object), NOT an hxtorch calibration, so assigning it to
+# exp.calibration never satisfied hxtorch and it recalibrated from scratch.
+# The official hxtorch demo (ts_12-hxtorch_snn_intro.rst) uses
+# save_nightly_calibration() + calib_helper.fixture_calibration_from_file(),
+# with the comment "To avoid time consuming implict calibration we load a
+# prepared calibration". Do that, and pre-flight it so a silent miss costs
+# a second instead of a whole session.
+NIGHTLY_CALIB = "spiking_cocolist.pbin"
+
+
+def _calib_helper():
+    last = None
+    for modpath in ("hxtorch.core.utils", "hxtorch.spiking.utils", "hxtorch.utils"):
+        try:
+            return getattr(__import__(modpath, fromlist=["calib_helper"]),
+                           "calib_helper")
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+    raise ImportError(f"calib_helper not found in any known location: {last!r}")
+
+
+def attach_nightly_calibration(exp):
+    """Load the prepared nightly calibration onto `exp`, or fail loudly.
+
+    Must be called BEFORE hxtorch.init_hardware(): save_nightly_calibration
+    opens its own ManagedConnection to read the chip identifier, which is
+    how the demo orders it too.
+    """
+    if "calibration" not in vars(type(exp)):
+        raise RuntimeError(
+            "hxsnn.Experiment has no 'calibration' property in this hxtorch "
+            "version - assigning it would be a dead attribute and the chip "
+            "would be implicitly recalibrated (the §108 failure). Set the "
+            "calibration on the ExecutionInstance instead; run "
+            "collab_scripts/probe_calib_api.py to see the real API.")
+    save_nightly_calibration(NIGHTLY_CALIB)
+    if not os.path.exists(NIGHTLY_CALIB):
+        raise RuntimeError(f"{NIGHTLY_CALIB} was not downloaded")
+    exp.calibration = _calib_helper().fixture_calibration_from_file(NIGHTLY_CALIB)
+    if exp.calibration is None:
+        raise RuntimeError("exp.calibration is still None after loading")
+    print(f"[calib] loaded {NIGHTLY_CALIB} "
+          f"({os.path.getsize(NIGHTLY_CALIB)} B) -> "
+          f"{type(exp.calibration).__name__}; implicit calibration skipped")
+# --------------------------------------------------------------------------
+
 
 # SAFETY: same convention as v1/v2 - MOCK=True by default. Run mock first
 # (should reproduce v1's mock cosine ~0.998, proving partitioning is
@@ -63,8 +117,9 @@ def run_fc1_partition(part_idx: int, mock: bool):
     exp = hxsnn.Experiment(dt=1e-6, mock=mock)
     try:
         if not mock:
+            # download+load the calib BEFORE init_hardware (demo order)
+            attach_nightly_calibration(exp)
             hxtorch.init_hardware()
-            exp.calibration = get_nightly_calibration()
         exp.inter_batch_entry_wait = int(125 * 8 * (TAU * 1e6))
 
         # 700-wide fan-in needs ceil(700/128)=6 circuits/neuron; use 8 for
@@ -98,8 +153,9 @@ def run_fc2_fc3(hidden_spikes: torch.Tensor, mock: bool):
     exp = hxsnn.Experiment(dt=1e-6, mock=mock)
     try:
         if not mock:
+            # download+load the calib BEFORE init_hardware (demo order)
+            attach_nightly_calibration(exp)
             hxtorch.init_hardware()
-            exp.calibration = get_nightly_calibration()
         exp.inter_batch_entry_wait = int(125 * 8 * (TAU * 1e6))
 
         # fan-in 128(+1 bias)=129 > 128 -> 2 circuits/neuron for both layers.
